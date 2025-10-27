@@ -1,144 +1,52 @@
-import pandas as pd
 import yaml
-import ipaddress
-from typing import Dict, List, Any, Union
 
-def parse_excel_to_inventory(excel_file: str, output_file: str = 'inventory.yml') -> None:
+def simple_excel_parser(excel_file: str, output_file: str = 'inventory.yml'):
     """
-    Парсит Excel файл и генерирует inventory.yml для Ansible
+    Упрощенная версия с минимальными зависимостями
     """
     try:
-        # Чтение Excel файла
-        df = pd.read_excel(excel_file)
+        # Если pandas не работает, используем встроенные средства
+        import csv
         
-        # Проверка наличия необходимых столбцов
-        required_columns = ['Name', 'HostName', 'Ip-address']
-        missing_columns = [col for col in required_columns if col not in df.columns]
+        # Конвертируем Excel в CSV сначала (вручную)
+        # или используем openpyxl напрямую
         
-        if missing_columns:
-            raise ValueError(f"Отсутствуют необходимые столбцы: {', '.join(missing_columns)}")
+        import openpyxl
         
-        # Создание структуры inventory
+        workbook = openpyxl.load_workbook(excel_file)
+        sheet = workbook.active
+        
         inventory = {'all': {'hosts': {}}}
         
-        # Обработка каждой строки
-        for index, row in df.iterrows():
-            host_name = str(row['Name']).strip()
-            hostname = str(row['HostName']).strip()
-            ip_address = str(row['Ip-address']).strip()
-            
-            # Пропускаем пустые строки
-            if not host_name or pd.isna(host_name):
+        # Пропускаем заголовок (первую строку)
+        for row in sheet.iter_rows(min_row=2, values_only=True):
+            if not row[0]:  # Пустое имя
                 continue
+                
+            host_name = str(row[0])
+            hostname = str(row[1]) if row[1] else ""
+            ip_address = str(row[2])
             
-            # Валидация IP-адреса с маской
-            try:
-                network = ipaddress.ip_network(ip_address, strict=False)
-                ip_without_mask = str(network.network_address)
-            except ValueError as e:
-                print(f"Ошибка в строке {index + 1}: некорректный IP-адрес '{ip_address}' - {e}")
-                continue
+            # Простая обработка IP (без валидации)
+            ip_parts = ip_address.split('/')
+            ip_without_mask = ip_parts[0]
             
-            # Создание записи для хоста
             host_vars = {
                 'ansible_host': ip_without_mask,
-                'ansible_user': 'admin'  # Замените на ваше имя пользователя
+                'ansible_user': 'admin'
             }
             
-            if hostname and not pd.isna(hostname):
+            if hostname:
                 host_vars['hostname'] = hostname
-            
+                
             inventory['all']['hosts'][host_name] = host_vars
         
-        # Запись в YAML файл
         with open(output_file, 'w', encoding='utf-8') as f:
-            yaml.dump(inventory, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+            yaml.dump(inventory, f, default_flow_style=False, allow_unicode=True)
         
-        print(f"✅ Inventory файл успешно создан: {output_file}")
-        print(f"📊 Обработано хостов: {len(inventory['all']['hosts'])}")
-        
-    except FileNotFoundError:
-        print(f"❌ Ошибка: Файл '{excel_file}' не найден")
-    except Exception as e:
-        print(f"❌ Ошибка при обработке файла: {e}")
-
-# Альтернативная версия без использования iterrows (более надежная)
-def parse_excel_safe(excel_file: str, output_file: str = 'inventory.yml') -> None:
-    """
-    Альтернативная версия без использования iterrows
-    """
-    try:
-        # Чтение Excel файла
-        df = pd.read_excel(excel_file)
-        
-        # Проверка наличия необходимых столбцов
-        required_columns = ['Name', 'HostName', 'Ip-address']
-        for col in required_columns:
-            if col not in df.columns:
-                raise ValueError(f"Отсутствует столбец: {col}")
-        
-        # Создание структуры inventory
-        inventory = {'all': {'hosts': {}}}
-        
-        # Обработка данных
-        for i in range(len(df)):
-            try:
-                host_name = str(df.iloc[i]['Name']).strip()
-                if not host_name or host_name == 'nan':
-                    continue
-                    
-                hostname = str(df.iloc[i]['HostName']).strip()
-                ip_address = str(df.iloc[i]['Ip-address']).strip()
-                
-                # Валидация IP-адреса
-                network = ipaddress.ip_network(ip_address, strict=False)
-                ip_without_mask = str(network.network_address)
-                
-                # Создание записи для хоста
-                host_vars = {
-                    'ansible_host': ip_without_mask,
-                    'ansible_user': 'admin'
-                }
-                
-                if hostname and hostname != 'nan':
-                    host_vars['hostname'] = hostname
-                
-                inventory['all']['hosts'][host_name] = host_vars
-                
-            except Exception as e:
-                print(f"Ошибка в строке {i + 1}: {e}")
-                continue
-        
-        # Запись в YAML файл
-        with open(output_file, 'w', encoding='utf-8') as f:
-            yaml.dump(inventory, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
-        
-        print(f"✅ Inventory файл успешно создан: {output_file}")
-        print(f"📊 Обработано хостов: {len(inventory['all']['hosts'])}")
+        print(f"✅ Inventory создан: {output_file}")
         
     except Exception as e:
         print(f"❌ Ошибка: {e}")
 
-# Создание тестового Excel файла
-def create_sample_excel():
-    """Создает пример Excel файла для тестирования"""
-    sample_data = {
-        'Name': ['web-server-01', 'web-server-02', 'db-server-01'],
-        'HostName': ['web01.local', 'web02.local', 'db01.local'],
-        'Ip-address': ['192.168.1.10/24', '192.168.1.11/24', '192.168.1.20/24']
-    }
-    
-    df = pd.DataFrame(sample_data)
-    df.to_excel('hosts.xlsx', index=False)
-    print("✅ Создан пример файла: hosts.xlsx")
-
-# Запуск
-if __name__ == "__main__":
-    # Создаем тестовый файл (если нужно)
-    # create_sample_excel()
-    
-    # Запускаем парсер (используйте безопасную версию если первая не работает)
-    parse_excel_to_inventory('hosts.xlsx', 'inventory.yml')
-    
-    # Или используйте альтернативную версию:
-    # parse_excel_safe('hosts.xlsx', 'inventory.yml')
+# simple_excel_parser('hosts.xlsx')
