@@ -1,0 +1,52 @@
+---
+- name: Quick SSHd config check
+  hosts: all
+  become: true
+  
+  tasks:
+    - name: Get main SSHd config
+      command: cat /etc/ssh/sshd_config
+      register: main_config
+      ignore_errors: true
+      
+    - name: Check for config.d directory
+      stat:
+        path: /etc/ssh/sshd_config.d
+      register: config_d
+      
+    - name: List files in config.d if exists
+      command: ls -la /etc/ssh/sshd_config.d/
+      register: config_d_list
+      when: config_d.stat.exists
+      
+    - name: Get config.d files content
+      shell: |
+        for file in /etc/ssh/sshd_config.d/*.conf; do
+          echo "=== FILE: $file ==="
+          cat "$file"
+          echo
+        done
+      register: config_d_content
+      when: config_d.stat.exists
+      
+    - name: Display results
+      debug:
+        msg: |
+          === SSHd Configuration Overview ===
+          Main config size: {{ main_config.stdout | length }} characters
+          Config.d exists: {{ config_d.stat.exists }}
+          {% if config_d.stat.exists %}
+          Files in config.d: {{ config_d_list.stdout_lines | select('match', '.*\\.conf$') | list | length }}
+          {% endif %}
+          
+    - name: Show main config (first 20 lines)
+      debug:
+        msg: |
+          === Main SSHd Config (first 20 lines) ===
+          {{ main_config.stdout_lines[0:20] | join('\n') }}
+      when: main_config.stdout_lines | length > 0
+      
+    - name: Show config.d content
+      debug:
+        msg: "{{ config_d_content.stdout }}"
+      when: config_d_content.stdout is defined
