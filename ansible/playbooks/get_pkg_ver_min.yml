@@ -1,0 +1,20 @@
+---
+- name: Проверка версии пакета
+  hosts: "{{ hosts | split(',') }}"
+  become: true
+  tasks:
+    - name: Сбор фактов о пакете
+      ansible.builtin.package_facts:
+        manager: "auto"
+
+    - name: Check and display package version
+      ansible.builtin.debug:
+        msg: |
+          ==================================
+          Хост: {{ ansible_hostname }}
+          ОС: {{ ansible_distribution }} {{ ansible_distribution_version }}
+          Пакет: {{ pkg }}
+          Статус: {{ 'УСТАНОВЛЕН' if package_name in ansible_facts.packages else 'НЕ УСТАНОВЛЕН' }}
+          Версия: {{ ansible_facts.packages[pkg][0].version if pkg in ansible_facts.packages else 'N/A' }}
+          Архитектура: {{ ansible_facts.packages[pkg][0].arch if pkg in ansible_facts.packages else 'N/A' }}
+          ==================================
