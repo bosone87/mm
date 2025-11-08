@@ -1,0 +1,30 @@
+---
+- name: Получение версии PostgreSQL
+  hosts: "{{ hosts | split(',') }}"
+  become: true
+  tasks:
+    - name: Получение версии клиента и сервера PostgreSQL
+      block:
+        - name: Версия клиента
+          command: psql --version
+          register: client_ver
+          changed_when: false
+          ignore_errors: true
+
+        - name: Версия сервера
+          shell: |
+            sudo -u postgres psql -c "SELECT version();" 2>/dev/null || echo "SERVER_NOT_AVAILABLE"
+          register: server_ver
+          changed_when: false
+          ignore_errors: true
+
+        - name: Вывод результата
+          debug:
+            msg: |
+              HOST: {{ inventory_hostname }}
+              PostgreSQL Client: {{ client_ver.stdout | default('NOT_INSTALLED') }}
+              PostgreSQL Server: {{ server_ver.stdout | default('NOT_ACCESSIBLE') | replace('SERVER_NOT_AVAILABLE', 'NOT_RUNNING') | trim }}
+              
+      rescue:
+        - debug:
+            msg: "{{ inventory_hostname }} - Ошибка получения версии PostgreSQL"
