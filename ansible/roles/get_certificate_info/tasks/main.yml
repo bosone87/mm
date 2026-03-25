@@ -1,0 +1,70 @@
+---
+- name: Проверить обязательные переменные
+  ansible.builtin.fail:
+    msg: "Необходимо задать target_host и target_port"
+  when: target_host is not defined or target_port is not defined or target_host == "" or target_port == ""
+
+- name: Проверить наличие openssl на удалённом хосте
+  ansible.builtin.command: "{{ openssl_binary }} version"
+  register: openssl_check
+  changed_when: false
+  ignore_errors: true
+
+- name: Прервать, если openssl не найден
+  ansible.builtin.fail:
+    msg: "openssl не найден на удалённом хосте (проверьте путь или установите openssl)"
+  when: openssl_check.failed
+
+- name: Выполнить openssl s_client для получения сертификата
+  ansible.builtin.shell: |
+    set -o pipefail
+    {{ openssl_binary }} s_client -connect {{ connect_host }}:{{ target_port }} \
+      -servername {{ target_host }} -showcerts 2>&1 < /dev/null | \
+      awk '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/ { if (found == 0) print; if (/-----END CERTIFICATE-----/) found=1 }'
+  args:
+    executable: /bin/bash
+  register: s_client_result
+  changed_when: false
+  failed_when:
+    - s_client_result.rc != 0
+    - "'certificate' not in s_client_result.stdout"  # если нет сертификата в выводе
+
+- name: Извлечь информацию о TLS версии и шифре из полного вывода
+  ansible.builtin.shell: |
+    {{ openssl_binary }} s_client -connect {{ connect_host }}:{{ target_port }} \
+      -servername {{ target_host }} 2>&1 < /dev/null | \
+      grep -E "^(New|Protocol|Cipher is)"
+  args:
+    executable: /bin/bash
+  register: tls_info_result
+  changed_when: false
+  ignore_errors: true
+
+- name: Парсинг TLS версии и шифра
+  ansible.builtin.set_fact:
+    tls_version: "{{ tls_info_result.stdout | regex_search('TLSv\\d\\.\\d') | default('не определена') }}"
+    cipher_suite: "{{ tls_info_result.stdout | regex_search('Cipher is (.*)', '\\1') | first | default('не определён') }}"
+
+- name: Разобрать сертификат на управляющем узле
+  community.crypto.x509_certificate:
+    content: "{{ s_client_result.stdout }}"
+  register: cert_info
+  delegate_to: localhost
+
+- name: Отображение информации о сертификате
+  ansible.builtin.debug:
+    msg:
+      - "Хост (SNI): {{ target_host }}"
+      - "Подключение к: {{ connect_host }}:{{ target_port }}"
+      - "Субъект (Subject): {{ cert_info.subject }}"
+      - "Издатель (Issuer): {{ cert_info.issuer }}"
+      - "Срок действия с: {{ cert_info.not_before | default('не определено') }}"
+      - "Срок действия по: {{ cert_info.not_after | default('не определено') }}"
+      - "Истёк: {{ cert_info.expired }}"
+      - "Серийный номер: {{ cert_info.serial_number }}"
+      - "Отпечаток (SHA1): {{ cert_info.fingerprints.sha1 | default('не определен') }}"
+      - "Алгоритм подписи: {{ cert_info.signature_algorithm }}"
+      - "Тип открытого ключа: {{ cert_info.public_key_type }}"
+      - "Размер ключа (бит): {{ cert_info.public_key_length | default('не определён') }}"
+      - "Версия TLS (согласованная): {{ tls_version }}"
+      - "Используемый шифр: {{ cipher_suite }}"

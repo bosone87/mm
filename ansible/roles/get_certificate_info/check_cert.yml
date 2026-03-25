@@ -1,0 +1,10 @@
+- name: Проверить сертификаты на веб-серверах (локальные сервисы)
+  hosts: "{{ hosts | split(',') }}"
+  gather_facts: false
+  become: true
+  roles:
+    - role: get_certificate_info
+      vars:
+        target_host: "{{ hosts | split(',') }}"      # ожидаемое имя в сертификате (SNI)
+        target_port: 443
+        # connect_host: "localhost"                   # по умолчанию localhost

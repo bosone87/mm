@@ -1,0 +1,17 @@
+---
+galaxy_info:
+  author: "BOS"
+  description: "Получение информации о TLS сертификате с локального порта удалённого хоста через openssl"
+  license: "MIT"
+  min_ansible_version: "2.10"
+  platforms:
+    - name: Generic
+      versions:
+        - all
+  galaxy_tags:
+    - ssl
+    - tls
+    - certificate
+    - openssl
+    - security
+dependencies: []
