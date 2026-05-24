@@ -1,0 +1,6 @@
+# roles/ssh_hardening/handlers/main.yml
+---
+- name: restart sshd
+  ansible.builtin.service:
+    name: "{{ sshd_service_name }}"
+    state: restarted

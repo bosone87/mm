@@ -1,0 +1,9 @@
+# roles/ssh_hardening/defaults/main.yml
+---
+sshd_config_path: /etc/ssh/sshd_config
+sshd_config_d_path: /etc/ssh/sshd_config.d
+sshd_sysconfig_path: /etc/sysconfig/sshd
+secure_conf_file: "{{ sshd_config_d_path }}/99-sec.conf"
+backup_dir: /etc/ssh/backup
+kex_algorithms: curve25519-sha256,diffie-hellman-group14-sha256,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512
+ciphers: aes256-ctr,aes192-ctr,aes128-ctr

@@ -1,0 +1,7 @@
+{# roles/ssh_hardening/templates/99-sec.conf.j2 #}
+# Управляется Ansible. Явно заданные криптоалгоритмы и ограничения.
+KexAlgorithms {{ kex_algorithms }}
+Ciphers {{ ciphers }}
+HostbasedAuthentication no
+PermitRootLogin no
+PermitEmptyPasswords no

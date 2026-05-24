@@ -1,0 +1,170 @@
+# roles/ssh_hardening/tasks/main.yml
+---
+- name: Сбор фактов об ОС
+  ansible.builtin.setup:
+  tags: always
+
+- name: Определить корректное имя службы SSH
+  ansible.builtin.set_fact:
+    sshd_service_name: "{{ 'ssh' if ansible_distribution == 'Ubuntu' else 'sshd' }}"
+  tags: always
+
+- name: Убедиться, что каталог для бэкапов существует
+  ansible.builtin.file:
+    path: "{{ backup_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0750'
+  tags: always
+
+- name: Создать резервную копию sshd_config (однократно за прогон)
+  ansible.builtin.copy:
+    src: "{{ sshd_config_path }}"
+    dest: "{{ backup_dir }}/sshd_config-{{ ansible_date_time.epoch }}"
+    remote_src: yes
+    owner: root
+    group: root
+    mode: '0600'
+    force: no
+  tags: always
+
+# ============================================================
+# Блок для старых ОС: CentOS 7, RHEL 7, Oracle Linux 7
+# ============================================================
+- name: Настройка SSH для legacy‑систем (без Include)
+  when:
+    - ansible_distribution in ['CentOS', 'RedHat', 'OracleLinux']
+    - ansible_distribution_major_version == '7'
+  block:
+    - name: Добавить KexAlgorithms в sshd_config
+      ansible.builtin.lineinfile:
+        path: "{{ sshd_config_path }}"
+        regexp: '^KexAlgorithms\s+'
+        line: "KexAlgorithms {{ kex_algorithms }}"
+        state: present
+      notify: restart sshd
+
+    - name: Добавить Ciphers в sshd_config
+      ansible.builtin.lineinfile:
+        path: "{{ sshd_config_path }}"
+        regexp: '^Ciphers\s+'
+        line: "Ciphers {{ ciphers }}"
+        state: present
+      notify: restart sshd
+
+    - name: Добавить HostbasedAuthentication no
+      ansible.builtin.lineinfile:
+        path: "{{ sshd_config_path }}"
+        regexp: '^HostbasedAuthentication\s+'
+        line: "HostbasedAuthentication no"
+        state: present
+      notify: restart sshd
+
+    - name: Добавить PermitRootLogin no
+      ansible.builtin.lineinfile:
+        path: "{{ sshd_config_path }}"
+        regexp: '^PermitRootLogin\s+'
+        line: "PermitRootLogin no"
+        state: present
+      notify: restart sshd
+
+    - name: Добавить PermitEmptyPasswords no
+      ansible.builtin.lineinfile:
+        path: "{{ sshd_config_path }}"
+        regexp: '^PermitEmptyPasswords\s+'
+        line: "PermitEmptyPasswords no"
+        state: present
+      notify: restart sshd
+
+# ============================================================
+# Блок для современных ОС: RHEL 8, OL 8/9, РЕДОС 7/8, Ubuntu 20.04/22.04
+# ============================================================
+- name: Настройка SSH для современных систем (с Include)
+  when: >
+    not (ansible_distribution in ['CentOS', 'RedHat', 'OracleLinux'] and
+         ansible_distribution_major_version == '7')
+  block:
+    # Отключение общесистемной криптополитики — только для RedHat-семейства
+    - name: Отключить CRYPTO_POLICY в /etc/sysconfig/sshd (только RedHat)
+      ansible.builtin.replace:
+        path: "{{ sshd_sysconfig_path }}"
+        regexp: '^#\s*CRYPTO_POLICY='
+        replace: 'CRYPTO_POLICY='
+      when: ansible_os_family == 'RedHat'
+      notify: restart sshd
+
+    - name: Убедиться, что CRYPTO_POLICY= присутствует и раскомментирован (только RedHat)
+      ansible.builtin.lineinfile:
+        path: "{{ sshd_sysconfig_path }}"
+        regexp: '^CRYPTO_POLICY='
+        line: 'CRYPTO_POLICY='
+        insertafter: EOF
+        state: present
+      when: ansible_os_family == 'RedHat'
+      notify: restart sshd
+
+    # Общие задачи для всех современных систем
+    - name: Создать каталог {{ sshd_config_d_path }}
+      ansible.builtin.file:
+        path: "{{ sshd_config_d_path }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Добавить Include в sshd_config
+      ansible.builtin.lineinfile:
+        path: "{{ sshd_config_path }}"
+        regexp: '^Include\s+{{ secure_conf_file | regex_escape() }}'
+        line: "Include {{ secure_conf_file }}"
+        insertafter: EOF
+        state: present
+      notify: restart sshd
+
+    - name: Развернуть конфигурацию {{ secure_conf_file }}
+      ansible.builtin.template:
+        src: 99-sec.conf.j2
+        dest: "{{ secure_conf_file }}"
+        owner: root
+        group: root
+        mode: '0644'
+      notify: restart sshd
+
+# ============================================================
+# Применение изменений и проверка
+# ============================================================
+- name: Применить все накопившиеся изменения (flush handlers)
+  meta: flush_handlers
+
+- name: Проверить, что sshd использует только заданные алгоритмы
+  block:
+    - name: Получить список kex и cipher от sshd
+      ansible.builtin.shell: |
+        sshd -T | grep -E '^(kexalgorithms|ciphers)'
+      register: sshd_crypto_output
+      changed_when: false
+
+    - name: Проверить соответствие KexAlgorithms
+      ansible.builtin.assert:
+        that:
+          - "'kexalgorithms {{ kex_algorithms }}' in sshd_crypto_output.stdout"
+        fail_msg: "KexAlgorithms в sshd не соответствует заданному набору! Вывод: {{ sshd_crypto_output.stdout }}"
+
+    - name: Проверить соответствие Ciphers
+      ansible.builtin.assert:
+        that:
+          - "'ciphers {{ ciphers }}' in sshd_crypto_output.stdout"
+        fail_msg: "Ciphers в sshd не соответствует заданному набору! Вывод: {{ sshd_crypto_output.stdout }}"
+
+- name: Проверить ssh-подключение с новыми алгоритмами
+  ansible.builtin.shell: |
+    ssh -o KexAlgorithms={{ kex_algorithms }} \
+        -o Ciphers={{ ciphers }} \
+        -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -o BatchMode=yes \
+        localhost 'echo OK'
+  register: ssh_test
+  changed_when: false
+  failed_when: ssh_test.stdout != 'OK'
