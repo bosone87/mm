@@ -1,0 +1,6 @@
+---
+# Файл для сохранения CSV-отчёта на хосте report_host
+report_dest: /tmp/host_report.csv
+
+# Хост, на котором создаётся отчёт
+report_host: adm.lin

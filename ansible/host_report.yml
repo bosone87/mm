@@ -1,0 +1,5 @@
+- name: Сбор фактов и генерация отчёта
+  hosts: all
+  gather_facts: true
+  roles:
+    - host_report

@@ -1,0 +1,29 @@
+---
+- name: Собрать информацию о хостах в единый список на отчётном хосте
+  ansible.builtin.set_fact:
+    host_info_list: >-
+      {{
+        host_info_list | default([]) +
+        [{
+          'hostname': hostvars[item].ansible_hostname,
+          'os_type': hostvars[item].ansible_distribution ~ ' ' ~ hostvars[item].ansible_distribution_version,
+          'kernel': hostvars[item].ansible_kernel,
+          'ip_address': hostvars[item].ansible_default_ipv4.address | default('N/A'),
+          'chassis': 'VM' if (hostvars[item].ansible_virtualization_type is defined and hostvars[item].ansible_virtualization_type != 'NA') else 'Physical'
+        }]
+      }}
+  loop: "{{ ansible_play_hosts }}"
+  when: hostvars[item].ansible_facts is defined
+  run_once: true
+  delegate_to: "{{ report_host }}"
+
+- name: Сгенерировать CSV-отчёт с нумерацией и сохранить на {{ report_host }}
+  ansible.builtin.copy:
+    content: |
+      Number,Hostname,OS Type,Kernel Version,IP Address,Chassis
+      {% for entry in host_info_list | sort(attribute='hostname') %}
+      {{ loop.index }},{{ entry.hostname }},{{ entry.os_type }},{{ entry.kernel }},{{ entry.ip_address }},{{ entry.chassis }}
+      {% endfor %}
+    dest: "{{ report_dest }}"
+  run_once: true
+  delegate_to: "{{ report_host }}"
