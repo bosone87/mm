@@ -1,0 +1,47 @@
+stages:
+  - check
+  - commit
+
+variables:
+  GIT_STRATEGY: clone          # чтобы гарантированно получить state.txt из репозитория
+  DOCKER_DRIVER: overlay2
+
+# Джоба проверки обновлений
+check-updates:
+  stage: check
+  image: rockylinux:8          # совместим с РедОС, содержит dnf и curl
+  before_script:
+    - dnf install -y dnf-plugins-core curl git   # на всякий случай
+  script:
+    - chmod +x check-updates.sh
+    - ./check-updates.sh
+  artifacts:
+    paths:
+      - state.txt              # сохраняем обновлённый файл для следующей джобы
+    expire_in: 1 hour
+  only:
+    - schedules                # запускаем ТОЛЬКО по расписанию
+
+# Джоба сохранения нового состояния в Git
+commit-state:
+  stage: commit
+  image: alpine:latest
+  dependencies:
+    - check-updates            # забираем артефакт (state.txt) от предыдущей джобы
+  before_script:
+    - apk add --no-cache git curl
+    - git config user.email "repo-monitor@corp.com"
+    - git config user.name "Package Watcher"
+  script:
+    - |
+      if ! git diff --exit-code state.txt; then
+        git add state.txt
+        git commit -m "Автообновление state.txt [skip ci]"
+        git push https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git HEAD:${CI_DEFAULT_BRANCH}
+      else
+        echo "Нет изменений в state.txt, коммит не требуется"
+      fi
+  only:
+    - schedules
+  needs:
+    - check-updates
