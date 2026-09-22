@@ -1,0 +1,96 @@
+---
+- name: Поиск инсталляций и версий Keycloak на хостах
+  hosts: all
+  gather_facts: true
+  tasks:
+    - name: Инициализация списка найденных версий
+      ansible.builtin.set_fact:
+        kc_detections: []
+
+    # 1. Проверка Docker-контейнеров
+    - name: Проверка наличия Docker CLI
+      ansible.builtin.command: which docker
+      register: docker_bin_check
+      failed_when: false
+      changed_when: false
+
+    - name: Поиск контейнеров с Keycloak
+      ansible.builtin.shell: |
+        docker ps -a --format "{{ '{{.Names}}' }}|{{ '{{.Image}}' }}" | grep -i keycloak || true
+      register: docker_search
+      when: docker_bin_check.rc == 0
+      failed_when: false
+      changed_when: false
+
+    - name: Фиксация версий из Docker-образов
+      ansible.builtin.set_fact:
+        kc_detections: >-
+          {{
+            kc_detections +
+            (docker_search.stdout_lines | default([]) | map('regex_replace', '^(.*)\|(.*)$', 'Docker [\\1]: образ \\2') | list)
+          }}
+      when:
+        - docker_bin_check.rc == 0
+        - docker_search.stdout | default('') | length > 0
+
+    # 2. Поиск jar-манифестов на файловой системе (архивная установка /opt, /var и т.д.)
+    - name: Поиск ключевых JAR-файлов Keycloak
+      ansible.builtin.shell: |
+        find /opt /usr /var/lib /home -maxdepth 5 -type f -name "keycloak-core-*.jar" 2>/dev/null | head -n 5 || true
+      register: jar_search
+      failed_when: false
+      changed_when: false
+
+    - name: Парсинг версий из найденных JAR-файлов
+      ansible.builtin.set_fact:
+        kc_detections: >-
+          {{
+            kc_detections +
+            (jar_search.stdout_lines | default([]) | map('regex_replace', '^.*keycloak-core-(.*)\\.jar$', 'Standalone/Service: v\\1') | list)
+          }}
+      when: jar_search.stdout | default('') | length > 0
+
+    # 3. Проверка системных пакетов (RHEL/CentOS/Debian/Ubuntu)
+    - name: Поиск пакетов RPM (RHEL/Rocky/Alma/Fedora)
+      ansible.builtin.shell: |
+        rpm -qa | grep -iE 'keycloak|rhbk' || true
+      register: rpm_search
+      when: ansible_os_family == "RedHat"
+      failed_when: false
+      changed_when: false
+
+    - name: Фиксация RPM-пакетов
+      ansible.builtin.set_fact:
+        kc_detections: "{{ kc_detections + ['RPM: ' ~ rpm_search.stdout] }}"
+      when:
+        - ansible_os_family == "RedHat"
+        - rpm_search.stdout | default('') | length > 0
+
+    - name: Поиск пакетов DEB (Debian/Ubuntu)
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${Package}-${Version}\n' | grep -iE 'keycloak|rhbk' || true
+      register: deb_search
+      when: ansible_os_family == "Debian"
+      failed_when: false
+      changed_when: false
+
+    - name: Фиксация DEB-пакетов
+      ansible.builtin.set_fact:
+        kc_detections: "{{ kc_detections + ['DEB: ' ~ deb_search.stdout] }}"
+      when:
+        - ansible_os_family == "Debian"
+        - deb_search.stdout | default('') | length > 0
+
+    # Формирование итогового статуса хоста
+    - name: Формирование финальной строки для отчета
+      ansible.builtin.set_fact:
+        keycloak_host_summary: >-
+          {{ (kc_detections | unique | join('; ')) if (kc_detections | length > 0) else 'Не найден' }}
+
+  # Вывод сводной таблицы
+  post_tasks:
+    - name: ИТОГОВЫЙ ОТЧЕТ ПО ИНФРАСТРУКТУРЕ
+      ansible.builtin.debug:
+        msg: "{{ item }} - {{ hostvars[item].keycloak_host_summary | default('Не проверен') }}"
+      loop: "{{ ansible_play_hosts }}"
+      run_once: true
