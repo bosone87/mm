@@ -1,5 +1,5 @@
 ---
-- name: Поиск инсталляций и версий Keycloak на хостах
+- name: Безопасный поиск инсталляций и версий Keycloak на хостах
   hosts: all
   gather_facts: true
   tasks:
@@ -7,10 +7,24 @@
       ansible.builtin.set_fact:
         kc_detections: []
 
-    # 1. Проверка Docker-контейнеров
-    - name: Проверка наличия Docker CLI
+    # =========================================================================
+    # 1. ПРОВЕРКА DOCKER С ВАЛИДАЦИЕЙ ПРАВ К СОКЕТУ
+    # =========================================================================
+    - name: Проверка наличия утилиты Docker CLI
       ansible.builtin.command: which docker
       register: docker_bin_check
+      failed_when: false
+      changed_when: false
+
+    - name: Проверка наличия сокета и прав доступа к Docker Daemon
+      ansible.builtin.shell: |
+        if [ -S /var/run/docker.sock ]; then
+          docker ps -q >/dev/null 2>&1
+        else
+          exit 1
+        fi
+      register: docker_sock_access
+      when: docker_bin_check.rc == 0
       failed_when: false
       changed_when: false
 
@@ -18,7 +32,9 @@
       ansible.builtin.shell: |
         docker ps -a --format "{{ '{{.Names}}' }}|{{ '{{.Image}}' }}" | grep -i keycloak || true
       register: docker_search
-      when: docker_bin_check.rc == 0
+      when:
+        - docker_bin_check.rc == 0
+        - docker_sock_access.rc == 0
       failed_when: false
       changed_when: false
 
@@ -31,12 +47,18 @@
           }}
       when:
         - docker_bin_check.rc == 0
+        - docker_sock_access.rc is defined and docker_sock_access.rc == 0
         - docker_search.stdout | default('') | length > 0
 
-    # 2. Поиск jar-манифестов на файловой системе (архивная установка /opt, /var и т.д.)
-    - name: Поиск ключевых JAR-файлов Keycloak
+    # =========================================================================
+    # 2. ПОИСК STANDALONE-АРТЕФАКТОВ С ОГРАНИЧЕНИЕМ I/O
+    # =========================================================================
+    - name: Поиск ключевых JAR-файлов Keycloak (с защитой диска)
       ansible.builtin.shell: |
-        find /opt /usr /var/lib /home -maxdepth 5 -type f -name "keycloak-core-*.jar" 2>/dev/null | head -n 5 || true
+        find /opt /usr /var/lib /home -maxdepth 5 \
+          -path "/var/lib/docker*" -prune -o \
+          -path "/var/lib/containerd*" -prune -o \
+          -xdev -type f -name "keycloak-core-*.jar" -print 2>/dev/null | head -n 5 || true
       register: jar_search
       failed_when: false
       changed_when: false
@@ -50,8 +72,10 @@
           }}
       when: jar_search.stdout | default('') | length > 0
 
-    # 3. Проверка системных пакетов (RHEL/CentOS/Debian/Ubuntu)
-    - name: Поиск пакетов RPM (RHEL/Rocky/Alma/Fedora)
+    # =========================================================================
+    # 3. ПРОВЕРКА СИСТЕМНЫХ ПАКЕТОВ (DEB / RPM)
+    # =========================================================================
+    - name: Поиск пакетов RPM (RHEL/Rocky/Alma/Fedora/CentOS)
       ansible.builtin.shell: |
         rpm -qa | grep -iE 'keycloak|rhbk' || true
       register: rpm_search
@@ -66,7 +90,7 @@
         - ansible_os_family == "RedHat"
         - rpm_search.stdout | default('') | length > 0
 
-    - name: Поиск пакетов DEB (Debian/Ubuntu)
+    - name: Поиск пакетов DEB (Debian/Ubuntu/Astra)
       ansible.builtin.shell: |
         dpkg-query -W -f='${Package}-${Version}\n' | grep -iE 'keycloak|rhbk' || true
       register: deb_search
@@ -81,13 +105,17 @@
         - ansible_os_family == "Debian"
         - deb_search.stdout | default('') | length > 0
 
-    # Формирование итогового статуса хоста
+    # =========================================================================
+    # 4. ФОРМИРОВАНИЕ СВОДКИ ДЛЯ ХОСТА
+    # =========================================================================
     - name: Формирование финальной строки для отчета
       ansible.builtin.set_fact:
         keycloak_host_summary: >-
           {{ (kc_detections | unique | join('; ')) if (kc_detections | length > 0) else 'Не найден' }}
 
-  # Вывод сводной таблицы
+  # =========================================================================
+  # 5. ВЫВОД ИТОГОВОЙ ТАБЛИЦЫ
+  # =========================================================================
   post_tasks:
     - name: ИТОГОВЫЙ ОТЧЕТ ПО ИНФРАСТРУКТУРЕ
       ansible.builtin.debug:
