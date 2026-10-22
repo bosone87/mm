@@ -1,0 +1,100 @@
+---
+- name: Поиск уязвимых версий PHP (CVE-2026-109618, CVE-2026-109619)
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    # Минимальные безопасные версии
+    fixed_versions:
+      "8.2": "8.2.35"
+      "8.3": "8.3.36"
+      "8.4": "8.4.27"
+      "8.5": "8.5.12"
+    # Префикс для поиска пакетов PHP
+    php_package_prefix: "php"
+
+  tasks:
+    # --- БЛОК 1: Проверка пакетов на хосте ---
+    - name: Сбор фактов об установленных пакетах
+      ansible.builtin.package_facts:
+        manager: auto
+      when: ansible_facts.pkg_mgr is defined
+
+    - name: Инициализация списка для отчета
+      ansible.builtin.set_fact:
+        vulnerable_php_host: []
+        php_packages_info: []
+
+    - name: Поиск и проверка пакетов PHP на хосте
+      ansible.builtin.set_fact:
+        php_packages_info: "{{ ansible_facts.packages | dict2items | selectattr('key', 'match', '^' + php_package_prefix) | list }}"
+      when: ansible_facts.packages is defined
+
+    - name: Анализ версий найденных пакетов PHP на хосте
+      ansible.builtin.set_fact:
+        vulnerable_php_host: "{{ vulnerable_php_host + [item.key + ' (' + item.value[0].version + ')'] }}"
+      loop: "{{ php_packages_info }}"
+      when: 
+        - item.value[0].version is defined
+        - >
+          (item.value[0].version is version('8.2.35', '<')) or
+          (item.value[0].version is version('8.3', '>=') and item.value[0].version is version('8.3.36', '<')) or
+          (item.value[0].version is version('8.4', '>=') and item.value[0].version is version('8.4.27', '<')) or
+          (item.value[0].version is version('8.5', '>=') and item.value[0].version is version('8.5.12', '<'))
+
+    # --- БЛОК 2: Проверка PHP в Docker-контейнерах ---
+    - name: Проверка наличия Docker на хосте
+      ansible.builtin.command: docker --version
+      register: docker_check
+      failed_when: false
+      changed_when: false
+
+    - name: Поиск уязвимого PHP в запущенных Docker-контейнерах
+      when: docker_check.rc == 0
+      block:
+        - name: Получение списка запущенных контейнеров
+          ansible.builtin.command: docker ps --format '{{ '{{' }}.Names{{ '}}' }}'
+          register: docker_containers
+          changed_when: false
+
+        - name: Проверка версии PHP в каждом контейнере
+          ansible.builtin.command: "docker exec {{ item }} php -v"
+          loop: "{{ docker_containers.stdout_lines }}"
+          register: php_container_versions
+          failed_when: false
+          changed_when: false
+
+        - name: Анализ PHP в контейнерах
+          ansible.builtin.set_fact:
+            vulnerable_php_container: "{{ vulnerable_php_container | default([]) + [item.item + ': ' + (item.stdout_lines[0] | default('PHP не найден'))] }}"
+          loop: "{{ php_container_versions.results }}"
+          when: 
+            - item.rc == 0
+            - item.stdout is defined
+            - >
+              (item.stdout is search('PHP 5\.')) or
+              (item.stdout is search('PHP 7\.')) or
+              (item.stdout is search('PHP 8\.0')) or
+              (item.stdout is search('PHP 8\.1')) or
+              (item.stdout is search('PHP 8\.2\.[0-9] |PHP 8\.2\.[12][0-9] |PHP 8\.2\.3[0-4]')) or
+              (item.stdout is search('PHP 8\.3\.[0-9] |PHP 8\.3\.[12][0-9] |PHP 8\.3\.3[0-5]')) or
+              (item.stdout is search('PHP 8\.4\.[0-9] |PHP 8\.4\.[12][0-9] ')) or
+              (item.stdout is search('PHP 8\.5\.[0-9] |PHP 8\.5\.1[01]'))
+
+    # --- БЛОК 3: Вывод результатов ---
+    - name: Вывод результатов проверки на хосте
+      ansible.builtin.debug:
+        msg: "Уязвимые пакеты PHP на хосте: {{ vulnerable_php_host | default([]) }}"
+      when: vulnerable_php_host | default([]) | length > 0
+
+    - name: Вывод результатов проверки в контейнерах
+      ansible.builtin.debug:
+        msg: "Уязвимые версии PHP в контейнерах: {{ vulnerable_php_container | default([]) }}"
+      when: vulnerable_php_container | default([]) | length > 0
+
+    - name: Сообщение, если уязвимостей не найдено
+      ansible.builtin.debug:
+        msg: "Уязвимых версий PHP не обнаружено."
+      when: 
+        - vulnerable_php_host | default([]) | length == 0
+        - vulnerable_php_container | default([]) | length == 0
