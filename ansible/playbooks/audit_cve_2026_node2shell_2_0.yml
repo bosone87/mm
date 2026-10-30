@@ -1,0 +1,189 @@
+---
+- name: Аудит уязвимости Node.js (CVE-2026-111497) и выгрузка CSV-отчета
+  hosts: all
+  gather_facts: true
+  vars:
+    # Настройки сохранения отчета на целевом хосте
+    report_delegate_host: "adm.lin"
+    report_dir: "/var/reports/cve-2026-111497"
+    report_filename: "nodejs_cve_2026_111497_{{ lookup('pipe', 'date +%Y-%m-%d_%H%M') }}.csv"
+    report_full_path: "{{ report_dir }}/{{ report_filename }}"
+
+    # Включать ли в CSV хосты, где Node.js не найден (полезно для закрытия отчета в ИБ по всему парку)
+    include_hosts_without_node: true
+
+    # Справочники исправленных версий
+    fixed_versions:
+      "22": "22.23.4"
+      "24": "24.22.1"
+      "26": "26.12.1"
+    fixed_brotli:
+      "1.0": "1.0.10"
+      "1.1": "1.1.1"
+      "1.2": "1.2.1"
+
+  tasks:
+    - name: Найти все бинарные файлы Node.js и определить их параметры
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -o pipefail
+          mapfile -t BINS < <(
+            {
+              which -a node nodejs 2>/dev/null
+              readlink -f /proc/[0-9]*/exe 2>/dev/null | sed 's/ (deleted)$//' | grep -E '/node(js)?$'
+              find /usr /opt /var /home /root /srv -xdev -name "node" -type f -executable 2>/dev/null \
+                | grep -E '/(bin/)?node$'
+            } | sort -u
+          )
+          for bin in "${BINS[@]}"; do
+            [ ! -x "$bin" ] && continue
+            ver=$("$bin" -v 2>/dev/null | tr -d '\r\n' || true)
+            [[ ! "$ver" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]] && continue
+            br=$("$bin" -p "process.versions.brotli || ''" 2>/dev/null | tr -d '\r\n' || true)
+            if ldd "$bin" 2>/dev/null | grep -q "libbrotlidec"; then
+              link="dynamic"
+            else
+              link="static"
+            fi
+            printf '{"path":"%s","version":"%s","brotli":"%s","linking":"%s"}\n' \
+              "$bin" "$ver" "$br" "$link"
+          done
+      register: _node_discovery
+      changed_when: false
+      check_mode: false
+
+    - name: Сформировать исходный список audit_entries на хосте
+      ansible.builtin.set_fact:
+        audit_entries: >-
+          {{
+            (_node_discovery.stdout_lines | map('from_json') | list)
+            if (_node_discovery.stdout_lines | length > 0)
+            else (
+              [{'path': '-', 'version': '-', 'brotli': '-', 'linking': '-'}]
+              if (include_hosts_without_node | bool)
+              else []
+            )
+          }}
+
+    - name: Оценить уязвимость каждой найденной версии Node.js
+      ansible.builtin.set_fact:
+        audit_report: >-
+          {{ audit_report | default([]) + [ item | combine({
+               'hostname': inventory_hostname,
+               'ip': ansible_facts['default_ipv4']['address'] | default('-'),
+               'os': (ansible_facts['distribution'] ~ ' ' ~ ansible_facts['distribution_version']) | trim,
+               'base': _base,
+               'major': _major,
+               'brotli_base': _brotli_base,
+               'fixed': _fixed,
+               'verdict': verdict
+             }) ] }}
+      loop: "{{ audit_entries }}"
+      vars:
+        # X.Y.Z без \d и \. — экранирование не зависит от Jinja2
+        _base: >-
+          {{
+            (item.version | default('') | string | trim
+             | regex_replace('^v', '')
+             | regex_search('^[0-9]+[.][0-9]+[.][0-9]+'))
+            | default('', true)
+          }}
+        _major: >-
+          {{ (_base.split('.') | first | trim) if (_base | length > 0) else '' }}
+        _fixed: >-
+          {{
+            fixed_versions.get(_major, fixed_versions.get(_major | int, '')) | trim
+          }}
+
+        # Извлекаем версию Brotli (если есть)
+        _brotli_base: >-
+          {{
+            (item.brotli | default('') | string | trim
+             | regex_search('^[0-9]+[.][0-9]+[.][0-9]+'))
+            | default('', true)
+          }}
+        _brotli_branch: >-
+          {{
+            (_brotli_base.split('.')[0] ~ '.' ~ _brotli_base.split('.')[1])
+            if (_brotli_base | length > 0) else ''
+          }}
+        _brotli_fixed_ver: >-
+          {{ fixed_brotli.get(_brotli_branch, '') | trim }}
+
+        # Проверка: безопасна ли сама библиотека Brotli
+        _brotli_is_safe: >-
+          {{
+            (_brotli_base | length > 0) and (
+              (_brotli_base is ansible.builtin.version('1.0.3', '<')) or
+              (_brotli_base is ansible.builtin.version('1.2.1', '>=')) or
+              (_brotli_fixed_ver | length > 0 and _brotli_base is ansible.builtin.version(_brotli_fixed_ver, '>='))
+            )
+          }}
+
+        # Проверка: попадает ли версия Node.js в уязвимый диапазон
+        _node_is_vuln: >-
+          {{
+            (_base | length > 0) and (
+              (_base is ansible.builtin.version('10.16.0', '>=') and (_major | int) < 22)
+              or ((_major | int) in [23, 25])
+              or (_fixed | length > 0 and _base is ansible.builtin.version(_fixed, '<'))
+            )
+          }}
+
+        _is_vuln: >-
+          {{ (_node_is_vuln | bool) and not (_brotli_is_safe | bool) }}
+
+        verdict: >-
+          {{
+            'не уязвима (Node.js отсутствует)'
+              if (item.path == '-')
+            else (
+              'НЕ УЯЗВИМА (Brotli ' ~ _brotli_base ~ ' пропатчен)'
+                if (_brotli_is_safe | bool)
+              else (
+                'УЯЗВИМА (ветка EOL, нужен переход на 22.23.4+ или workaround)'
+                  if ((_node_is_vuln | bool) and (_fixed | length == 0))
+                else (
+                  'УЯЗВИМА (нужно обновление до ' ~ _fixed ~ ')'
+                    if (_is_vuln | bool)
+                  else (
+                    'не уязвима (исправлено в ' ~ _fixed ~ ')'
+                      if (_fixed | length > 0)
+                    else (
+                      'не уязвима (до 10.16.0 нет Brotli)'
+                        if (_base | length > 0 and _base is ansible.builtin.version('10.16.0', '<'))
+                      else 'требует ручной проверки'
+                    )
+                  )
+                )
+              )
+            )
+          }}
+
+    - name: Создать целевой каталог для отчетов на {{ report_delegate_host }}
+      ansible.builtin.file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: "0750"
+      delegate_to: "{{ report_delegate_host }}"
+      run_once: true
+
+    - name: Сформировать и сохранить сводный CSV-отчет на {{ report_delegate_host }}
+      ansible.builtin.copy:
+        dest: "{{ report_full_path }}"
+        mode: "0640"
+        content: |
+          Hostname;IP;OS;Node_Path;Node_Version;Major;Brotli_Version;Linking;Fixed_In;Verdict
+          {% for host in ansible_play_hosts_all %}
+          {% set host_entries = hostvars[host].get('audit_report', []) %}
+          {% if host_entries | length > 0 %}
+          {% for entry in host_entries %}
+          {{ entry.hostname }};{{ entry.ip }};{{ entry.os }};{{ entry.path }};{{ entry.base | default('-', true) }};{{ entry.major | default('-', true) }};{{ entry.brotli_base | default('-', true) }};{{ entry.linking }};{{ entry.fixed | default('-', true) }};{{ entry.verdict }}
+          {% endfor %}
+          {% elif host not in ansible_play_hosts %}
+          {{ host }};-;-;-;-;-;-;-;-;НЕДОСТУПЕН (ошибка подключения Ansible)
+          {% endif %}
+          {% endfor %}
+      delegate_to: "{{ report_delegate_host }}"
+      run_once: true
