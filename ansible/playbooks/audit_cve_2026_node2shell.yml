@@ -1,0 +1,163 @@
+---
+- name: Аудит Node.js — хосты и контейнеры (CVE-2026-111497)
+  hosts: all
+  become: false
+  gather_facts: true
+
+  vars:
+    fixed_versions:
+      "22": "22.23.4"
+      "24": "24.22.1"
+      "26": "26.12.1"
+
+  tasks:
+    # ---------- 1. АУДИТ ХОСТА ----------
+    - name: Проверить наличие бинарника node в PATH
+      ansible.builtin.command: which node
+      register: node_path
+      changed_when: false
+      failed_when: false
+
+    - name: Получить версию Node.js на хосте (CLI)
+      ansible.builtin.command: node --version
+      register: node_cli_version
+      changed_when: false
+      failed_when: false
+      when: node_path.rc == 0
+
+    - name: Собрать сведения об установленных пакетах
+      ansible.builtin.package_facts:
+        manager: auto
+      when: ansible_facts.pkg_mgr is defined
+
+    # ---------- 2. ОБНАРУЖЕНИЕ RUNTIME КОНТЕЙНЕРОВ ---------- 
+    - name: Получить список запущенных контейнеров Docker
+      ansible.builtin.command: docker ps --format {% raw %}{{.Names}}{% endraw %}
+      register: docker_containers
+      changed_when: false
+      failed_when: false
+
+    - name: Получить список запущенных контейнеров Podman
+      ansible.builtin.command: podman ps --format {% raw %}{{.Names}}{% endraw %}
+      register: podman_containers
+      changed_when: false
+      failed_when: false
+      when: docker_containers.rc != 0
+
+    - name: Определить runtime и список контейнеров
+      ansible.builtin.set_fact:
+        container_runtime: >-
+          {{
+            'docker' if docker_containers.rc == 0
+            else ('podman' if (podman_containers.rc | default(1)) == 0 else 'none')
+          }}
+        container_names: >-
+          {{
+            (docker_containers.stdout_lines | default([]))
+            if docker_containers.rc == 0
+            else ((podman_containers.stdout_lines | default([])) if (podman_containers.rc | default(1)) == 0 else [])
+          }}
+
+    # ---------- 3. АУДИТ КОНТЕЙНЕРОВ ----------
+    - name: Получить версию Node.js в каждом запущенном контейнере
+      ansible.builtin.command:
+        argv:
+          - "{{ container_runtime }}"
+          - exec
+          - "{{ item }}"
+          - node
+          - --version
+      loop: "{{ container_names }}"
+      register: container_node_versions
+      changed_when: false
+      failed_when: false
+      when: container_names | length > 0
+
+    # ---------- 4. СБОР ЕДИНОГО СПИСКА ----------
+    - name: Инициализировать единый список найденных версий
+      ansible.builtin.set_fact:
+        audit_entries: []
+
+    - name: Добавить версию хоста (CLI)
+      ansible.builtin.set_fact:
+        audit_entries: >-
+          {{ audit_entries + [ {
+               'source': 'хост CLI',
+               'version': node_cli_version.stdout | trim | regex_replace('^v', '')
+             } ] }}
+      when: node_cli_version is defined and node_cli_version.rc == 0
+
+    - name: Добавить версии пакетов на хосте
+      ansible.builtin.set_fact:
+        audit_entries: >-
+          {{ audit_entries + [ {
+               'source': 'пакет ' + item.key,
+               'version': item.value[0].version
+             } ] }}
+      loop: >-
+        {{
+          ansible_facts.packages | default({})
+          | dict2items
+          | selectattr('key', 'match', '^(node|nodejs.*|node-.*)$')
+          | list
+        }}
+      when: (item.value | default([])) | length > 0
+
+    - name: Добавить версии из контейнеров
+      ansible.builtin.set_fact:
+        audit_entries: >-
+          {{ audit_entries + [ {
+               'source': 'контейнер ' + item.item,
+               'version': item.stdout | trim | regex_replace('^v', '')
+             } ] }}
+      loop: "{{ container_node_versions.results | default([]) }}"
+      when:
+        - (item.rc | default(1)) == 0
+        - (item.stdout | default('') | trim | length) > 0
+
+    # ---------- 5. ОЦЕНКА УЯЗВИМОСТИ ----------
+    - name: Оценить уязвимость каждой найденной версии
+      ansible.builtin.set_fact:
+        audit_report: >-
+          {{ audit_report | default([]) + [ item | combine({ 'verdict': verdict }) ] }}
+      loop: "{{ audit_entries }}"
+      vars:
+        # Извлекаем базовую X.Y.Z (отбрасывает суффиксы вида -1.el8, rc1 и т.п.)
+        _base: >-
+          {{ item.version
+             | trim
+             | regex_replace('^v', '')
+             | regex_search('^\\d+\\.\\d+\\.\\d+')
+             | default('') }}
+        _major: "{{ (_base | split('.') | first) if (_base | length > 0) else '' }}"
+        _fixed: "{{ fixed_versions.get(_major, '') }}"
+        _is_vuln: >-
+          {{
+            (_base | length > 0) and (
+              ((_major | int) < 22)
+              or ((_fixed | length > 0) and (_base is version_compare(_fixed, '<')))
+            )
+          }}
+        verdict: >-
+          {{
+            'УЯЗВИМА' if _is_vuln
+            else ('не уязвима (исправлено в ' ~ _fixed ~ ')' if (_fixed | length > 0)
+            else 'требует ручной проверки')
+          }}
+
+    # ---------- 6. ВЫВОД ----------
+    - name: Показать итоговый отчёт по Node.js
+      ansible.builtin.debug:
+        msg: |
+          Отчёт по Node.js (CVE-2026-111497) для {{ inventory_hostname }}
+          ==================================================
+          Runtime контейнеров: {{ container_runtime }}
+          Просканировано запущенных контейнеров: {{ container_names | length }}
+          {% if audit_report | default([]) | length > 0 %}
+          Найденные версии:
+          {% for item in audit_report %}
+          - {{ item.source }}: {{ item.version }} → {{ item.verdict }}
+          {% endfor %}
+          {% else %}
+          Node.js не обнаружен ни на хосте, ни в запущенных контейнерах.
+          {% endif %}
