@@ -1,0 +1,132 @@
+---
+- name: Аудит хостов Ubuntu 20.04 и 22.04 на уязвимость CVE-2026-98432
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    report_host: "adm.lin"
+    report_dir: "/var/reports/cve_audit"
+
+  tasks:
+    - name: Выполнение проверок только на хостах Ubuntu 20.04 и 22.04
+      when:
+        - ansible_facts['distribution'] == 'Ubuntu'
+        - ansible_facts['distribution_version'] in ['20.04', '22.04']
+      block:
+        - name: Проверка changelog ядра на наличие патча CVE-2026-98432
+          ansible.builtin.command:
+            cmd: "zgrep -i 'CVE-2026-98432' /usr/share/doc/linux-image-{{ ansible_facts['kernel'] }}/changelog.Debian.gz"
+          register: changelog_check
+          changed_when: false
+          failed_when: false
+
+        - name: Проверка статуса Livepatch / KernelCare (если установлены)
+          ansible.builtin.shell:
+            cmd: |
+              if command -v canonical-livepatch >/dev/null 2>&1; then
+                canonical-livepatch status | grep -i "CVE-2026-98432" && echo "LIVEPATCHED" || echo "NO_LIVEPATCH"
+              elif command -v kcarectl >/dev/null 2>&1; then
+                kcarectl --patch-info | grep -i "CVE-2026-98432" && echo "KCARE_PATCHED" || echo "NO_KCARE"
+              else
+                echo "NONE"
+              fi
+          register: livepatch_check
+          changed_when: false
+          failed_when: false
+
+        - name: Проверка параметра ядра net.mptcp.enabled
+          ansible.builtin.command:
+            cmd: sysctl -n net.mptcp.enabled
+          register: mptcp_check
+          changed_when: false
+          failed_when: false
+
+        - name: Проверка iptables на наличие правила блокировки IHL > 5 (модуль u32)
+          ansible.builtin.command:
+            cmd: iptables -S INPUT
+          register: iptables_check
+          changed_when: false
+          failed_when: false
+
+        - name: Проверка nftables на наличие правила блокировки ip hdrlength > 5
+          ansible.builtin.command:
+            cmd: nft list ruleset
+          register: nftables_check
+          changed_when: false
+          failed_when: false
+
+        - name: Подсчет внешних слушающих TCP-портов (кроме 127.0.0.1)
+          ansible.builtin.shell:
+            cmd: |
+              set -o pipefail
+              ss -tlpn4 | awk 'NR>1 {print $4}' | grep -vE '^127\.' | wc -l
+            executable: /bin/bash
+          register: listening_tcp_check
+          changed_when: false
+          failed_when: false
+
+        - name: Анализ полученных данных и статуса компенсирующих мер
+          ansible.builtin.set_fact:
+            is_patched: >-
+              {{ (changelog_check.rc == 0) or
+                 ('LIVEPATCHED' in livepatch_check.stdout) or
+                 ('KCARE_PATCHED' in livepatch_check.stdout) }}
+            mptcp_enabled: >-
+              {{ '1 (Вкл)' if (mptcp_check.rc == 0 and mptcp_check.stdout | trim == '1') else '0 (Выкл или Н/Д)' }}
+            has_fw_mitigation: >-
+              {{ ('0>>24&0x0f=6:15' in iptables_check.stdout) or
+                 ('hdrlength > 5' in nftables_check.stdout) or
+                 ('hdrlength >= 24' in nftables_check.stdout) }}
+            ext_tcp_listeners: "{{ listening_tcp_check.stdout | trim | default('0') }}"
+
+        - name: Расчет итогового статуса уязвимости для хоста
+          ansible.builtin.set_fact:
+            vuln_verdict: >-
+              {% if is_patched %}
+              УСТАНОВЛЕН ПАТЧ (Безопасно)
+              {% elif has_fw_mitigation and mptcp_enabled != '1 (Вкл)' %}
+              ЗАЩИЩЕН WORKAROUND (Файрвол + MPTCP Выкл)
+              {% elif has_fw_mitigation and mptcp_enabled == '1 (Вкл)' %}
+              ЧАСТИЧНО ЗАЩИЩЕН (Только файрвол, MPTCP Вкл)
+              {% elif mptcp_enabled == '1 (Вкл)' %}
+              УЯЗВИМ - КРИТИЧЕСКИЙ РИСК (Риск RCE и DoS, MPTCP Вкл)
+              {% else %}
+              УЯЗВИМ - ВЫСОКИЙ РИСК (Риск DoS / UAF)
+              {% endif %}
+
+        - name: Вывод результата проверки хоста в консоль
+          ansible.builtin.debug:
+            msg: >-
+              Хост: {{ inventory_hostname }} | ОС: Ubuntu {{ ansible_facts['distribution_version'] }} |
+              Ядро: {{ ansible_facts['kernel'] }} | MPTCP: {{ mptcp_enabled }} |
+              Защита FW: {{ 'Да' if has_fw_mitigation else 'Нет' }} | Статус: {{ vuln_verdict | trim }}
+
+    - name: Сохранение сводного CSV-отчета на сервер adm.lin
+      run_once: true
+      delegate_to: "{{ report_host }}"
+      block:
+        - name: Формирование имени файла отчета с текущей датой и временем
+          ansible.builtin.set_fact:
+            report_file: "{{ report_dir }}/cve_2026_98432_audit_{{ ansible_facts['date_time']['date'] }}_{{ ansible_facts['date_time']['time'] | replace(':', '-') }}.csv"
+
+        - name: Создание целевой директории для отчетов на adm.lin
+          ansible.builtin.file:
+            path: "{{ report_dir }}"
+            state: directory
+            mode: "0755"
+
+        - name: Запись итогового CSV-отчета на adm.lin
+          ansible.builtin.copy:
+            dest: "{{ report_file }}"
+            mode: "0644"
+            content: |
+              Хост,IP_адрес,Версия_ОС,Версия_ядра,Статус_MPTCP,Защита_файрволом,Внешние_TCP_порты,Итоговый_статус
+              {% for host in ansible_play_hosts_all %}
+              {% if hostvars[host]['vuln_verdict'] is defined %}
+              {{ host }},{{ hostvars[host]['ansible_facts']['default_ipv4']['address'] | default('Н/Д') }},Ubuntu {{ hostvars[host]['ansible_facts']['distribution_version'] }},{{ hostvars[host]['ansible_facts']['kernel'] }},{{ hostvars[host]['mptcp_enabled'] }},{{ 'Да' if hostvars[host]['has_fw_mitigation'] else 'Нет' }},{{ hostvars[host]['ext_tcp_listeners'] }},{{ hostvars[host]['vuln_verdict'] | trim }}
+              {% endif %}
+              {% endfor %}
+
+        - name: Вывод пути к сохраненному отчету на adm.lin
+          ansible.builtin.debug:
+            msg: "Отчет по уязвимости CVE-2026-98432 успешно сохранен на {{ report_host }} по пути: {{ report_file }}"
