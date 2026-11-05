@@ -1,0 +1,189 @@
+---
+- name: Аудит уязвимостей BDU
+  hosts: all
+  gather_facts: true
+  become: true
+  vars:
+    report_output_dir: "./bdu_audit_reports"
+
+  tasks:
+    - name: Сбор данных об установленных системных пакетах (RPM/DEB)
+      ansible.builtin.package_facts:
+        manager: auto
+      check_mode: false
+
+    - name: Проверка системных пакетов (libssh2, nginx, squid, ffmpeg, gpac, django)
+      ansible.builtin.set_fact:
+        installed_target_packages: >-
+          {{
+            ansible_facts.packages | dict2items
+            | selectattr('key', 'match', '^(libssh2.*|nginx.*|squid.*|ffmpeg.*|libavcodec.*|gpac.*|libgpac.*|.*django.*|zimbra.*)$')
+            | items2dict
+          }}
+
+    - name: Аудит ядра и уязвимых модулей (BDU: 2026-08879, 2026-08889, 2026-08426, 2026-03970)
+      ansible.builtin.shell: |
+        set -o pipefail
+        echo "=== KERNEL ==="
+        uname -r
+        echo "=== LOADED_MODULES ==="
+        lsmod | grep -E '^(act_pedit|intel_vpu|ivpu|i8042)\b' || echo "none"
+        echo "=== BUILTIN_I8042 ==="
+        if [ -d /sys/bus/platform/drivers/i8042 ]; then echo "i8042_active"; else echo "i8042_inactive"; fi
+        echo "=== MODPROBE_BLACKLIST ==="
+        grep -rnE 'blacklist\s+(act_pedit|intel_vpu|ivpu)' /etc/modprobe.d/ 2>/dev/null || echo "not_blacklisted"
+      args:
+        executable: /bin/bash
+      register: kernel_check
+      changed_when: false
+      check_mode: false
+
+    - name: Поиск Gitea act_runner (BDU: 2026-08914)
+      ansible.builtin.shell: |
+        set -o pipefail
+        echo "=== PROCESS ==="
+        ps -ef | grep '[a]ct_runner' || echo "not_running"
+        echo "=== BINARIES ==="
+        for p in $(which act_runner 2>/dev/null) $(find /opt /usr/local /srv /home /var/lib -maxdepth 4 -type f -name "act_runner" 2>/dev/null); do
+          if [ -x "$p" ]; then
+            echo "$p: $($p --version 2>/dev/null || echo 'version_unknown')"
+          fi
+        done
+      args:
+        executable: /bin/bash
+      register: act_runner_check
+      changed_when: false
+      check_mode: false
+
+    - name: Поиск Django и ASGI в Python окружениях (BDU: 2026-07723, 2026-07722)
+      ansible.builtin.shell: |
+        set -o pipefail
+        echo "=== SYSTEM_PYTHON ==="
+        python3 -c "import django; print('system_django:', django.get_version())" 2>/dev/null || echo "no_system_django"
+        echo "=== VENV_DJANGO ==="
+        for cfg in $(find /opt /var/www /srv /home /usr/local -maxdepth 5 -name "pyvenv.cfg" 2>/dev/null); do
+          venv_dir=$(dirname "$cfg")
+          if [ -x "$venv_dir/bin/python" ]; then
+            ver=$("$venv_dir/bin/python" -c "import django; print(django.get_version())" 2>/dev/null)
+            if [ -n "$ver" ]; then
+              asgi=$("$venv_dir/bin/pip" list 2>/dev/null | grep -iE 'daphne|uvicorn|hypercorn|asgiref' | tr '\n' ' ')
+              echo "$venv_dir: Django=$ver | ASGI_Pkgs=[$asgi]"
+            fi
+          fi
+        done
+      args:
+        executable: /bin/bash
+      register: django_check
+      changed_when: false
+      check_mode: false
+
+    - name: Проверка Zimbra Collaboration Suite (BDU: 2022-05086)
+      ansible.builtin.shell: |
+        if [ -d /opt/zimbra ]; then
+          su - zimbra -c "zmcontrol -v" 2>/dev/null || echo "zimbra_dir_exists_version_check_failed"
+        else
+          echo "not_installed"
+        fi
+      args:
+        executable: /bin/bash
+      register: zimbra_check
+      changed_when: false
+      check_mode: false
+
+    - name: Проверка GPAC / MP4Box и декодеров FFmpeg (BDU: 2026-08912, 2026-08913, 2026-08610)
+      ansible.builtin.shell: |
+        set -o pipefail
+        echo "=== MP4BOX ==="
+        if command -v MP4Box >/dev/null 2>&1; then
+          MP4Box -version 2>&1 | head -n 3
+        else
+          find /opt /usr/local -maxdepth 4 -type f -name "MP4Box" 2>/dev/null || echo "not_found"
+        fi
+        echo "=== FFMPEG ==="
+        if command -v ffmpeg >/dev/null 2>&1; then
+          ffmpeg -version 2>&1 | head -n 2
+          ffmpeg -decoders 2>/dev/null | grep -E '\b(rasc|magicyuv)\b' || echo "decoders_not_present"
+        else
+          echo "ffmpeg_not_installed"
+        fi
+      args:
+        executable: /bin/bash
+      register: media_check
+      changed_when: false
+      check_mode: false
+
+    - name: Проверка Nextcloud и модуля user_oidc (BDU: 2026-08694)
+      ansible.builtin.shell: |
+        set -o pipefail
+        for occ in $(find /var/www /srv /opt /home -maxdepth 4 -type f -name "occ" 2>/dev/null); do
+          nc_dir=$(dirname "$occ")
+          echo "Found Nextcloud at: $nc_dir"
+          if [ -f "$nc_dir/apps/user_oidc/appinfo/info.xml" ]; then
+            ver=$(grep -oPm1 "(?<=<version>)[^<]+" "$nc_dir/apps/user_oidc/appinfo/info.xml" 2>/dev/null || echo "unknown")
+            echo "user_oidc installed, version: $ver"
+          else
+            echo "user_oidc app directory not found"
+          fi
+        done
+      args:
+        executable: /bin/bash
+      register: nextcloud_check
+      changed_when: false
+      check_mode: false
+
+    - name: Проверка Nginx и Squid (BDU: 2026-08881, 2026-08611)
+      ansible.builtin.shell: |
+        set -o pipefail
+        echo "=== NGINX ==="
+        if command -v nginx >/dev/null 2>&1; then
+          nginx -V 2>&1 | tr ' ' '\n' | grep -E 'version|http_v2_module|http_grpc_module'
+        else
+          echo "nginx_not_in_path"
+        fi
+        echo "=== SQUID ==="
+        if command -v squid >/dev/null 2>&1; then
+          squid -v 2>&1 | head -n 2
+        else
+          echo "squid_not_in_path"
+        fi
+      args:
+        executable: /bin/bash
+      register: proxy_web_check
+      changed_when: false
+      check_mode: false
+
+    - name: Формирование итоговой структуры отчета
+      ansible.builtin.set_fact:
+        host_bdu_report:
+          hostname: "{{ ansible_facts.hostname }}"
+          fqdn: "{{ ansible_facts.fqdn }}"
+          os_family: "{{ ansible_facts.os_family }}"
+          distribution: "{{ ansible_facts.distribution }}"
+          distribution_version: "{{ ansible_facts.distribution_version }}"
+          kernel: "{{ ansible_facts.kernel }}"
+          matched_packages: "{{ installed_target_packages }}"
+          checks:
+            kernel_and_modules: "{{ kernel_check.stdout_lines }}"
+            gitea_act_runner: "{{ act_runner_check.stdout_lines }}"
+            django_and_asgi: "{{ django_check.stdout_lines }}"
+            zimbra: "{{ zimbra_check.stdout_lines }}"
+            gpac_and_ffmpeg: "{{ media_check.stdout_lines }}"
+            nextcloud_oidc: "{{ nextcloud_check.stdout_lines }}"
+            nginx_and_squid: "{{ proxy_web_check.stdout_lines }}"
+
+    - name: Создание локальной папки для отчетов на управляющем узле
+      ansible.builtin.file:
+        path: "{{ report_output_dir }}"
+        state: directory
+        mode: '0750'
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    - name: Сохранение JSON-отчета по хосту на управляющий узел
+      ansible.builtin.copy:
+        content: "{{ host_bdu_report | to_nice_json }}"
+        dest: "{{ report_output_dir }}/{{ inventory_hostname }}_bdu_audit.json"
+        mode: '0640'
+      delegate_to: localhost
+      become: false
