@@ -1,52 +1,55 @@
 ---
-- name: Аудит уязвимостей BDU
+- name: Безопасный аудит уязвимостей BDU (Read-Only) с сохранением в CSV
   hosts: all
   gather_facts: true
   become: true
   vars:
     report_output_dir: "./bdu_audit_reports"
+    summary_csv_file: "./bdu_audit_reports/bdu_summary_report.csv"
+    csv_header: "Hostname;FQDN;IP_Address;OS_Family;Distribution;Kernel;Matched_System_Packages;Kernel_and_Modules_BDU_08879_08889_08426_03970;Gitea_act_runner_BDU_08914;Django_and_ASGI_BDU_07723_07722;Zimbra_BDU_05086;GPAC_and_FFmpeg_BDU_08912_08913_08610;Nextcloud_OIDC_BDU_08694;Nginx_and_Squid_BDU_08881_08611"
 
   tasks:
     - name: Сбор данных об установленных системных пакетах (RPM/DEB)
       ansible.builtin.package_facts:
         manager: auto
       check_mode: false
+      tags: [packages]
 
-    - name: Проверка системных пакетов (libssh2, nginx, squid, ffmpeg, gpac, django)
+    - name: Фильтрация целевых системных пакетов (libssh2, nginx, squid, ffmpeg, gpac, django, zimbra)
       ansible.builtin.set_fact:
         installed_target_packages: >-
-          {{
-            ansible_facts.packages | dict2items
-            | selectattr('key', 'match', '^(libssh2.*|nginx.*|squid.*|ffmpeg.*|libavcodec.*|gpac.*|libgpac.*|.*django.*|zimbra.*)$')
-            | items2dict
-          }}
+          {%- set pkg_list = [] -%}
+          {%- for k, v in ansible_facts.packages.items() -%}
+            {%- if k is match('^(libssh2.*|nginx.*|squid.*|ffmpeg.*|libavcodec.*|gpac.*|libgpac.*|.*django.*|zimbra.*)$') -%}
+              {%- for item in v -%}
+                {%- set _ = pkg_list.append(item.name ~ '=' ~ item.version ~ ('-' ~ item.release if item.release is defined and item.release else '')) -%}
+              {%- endfor -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ pkg_list | join(' | ') | default('none', true) }}
+      tags: [packages]
 
     - name: Аудит ядра и уязвимых модулей (BDU: 2026-08879, 2026-08889, 2026-08426, 2026-03970)
       ansible.builtin.shell: |
         set -o pipefail
-        echo "=== KERNEL ==="
-        uname -r
-        echo "=== LOADED_MODULES ==="
-        lsmod | grep -E '^(act_pedit|intel_vpu|ivpu|i8042)\b' || echo "none"
-        echo "=== BUILTIN_I8042 ==="
-        if [ -d /sys/bus/platform/drivers/i8042 ]; then echo "i8042_active"; else echo "i8042_inactive"; fi
-        echo "=== MODPROBE_BLACKLIST ==="
-        grep -rnE 'blacklist\s+(act_pedit|intel_vpu|ivpu)' /etc/modprobe.d/ 2>/dev/null || echo "not_blacklisted"
+        echo "KERNEL: $(uname -r)"
+        echo "LOADED_MODULES: $(lsmod | grep -E '^(act_pedit|intel_vpu|ivpu|i8042)\b' | awk '{print $1}' | tr '\n' ',' || echo 'none')"
+        if [ -d /sys/bus/platform/drivers/i8042 ]; then echo "I8042_SYSFS: active"; else echo "I8042_SYSFS: inactive"; fi
+        echo "BLACKLIST: $(grep -rnE '^\s*(blacklist|install)\s+(act_pedit|intel_vpu|ivpu)' /etc/modprobe.d/ 2>/dev/null | tr '\n' ',' || echo 'not_blacklisted')"
       args:
         executable: /bin/bash
       register: kernel_check
       changed_when: false
       check_mode: false
+      tags: [kernel]
 
     - name: Поиск Gitea act_runner (BDU: 2026-08914)
       ansible.builtin.shell: |
         set -o pipefail
-        echo "=== PROCESS ==="
-        ps -ef | grep '[a]ct_runner' || echo "not_running"
-        echo "=== BINARIES ==="
+        ps -ef | grep -q '[a]ct_runner' && echo "PROCESS: running" || echo "PROCESS: not_running"
         for p in $(which act_runner 2>/dev/null) $(find /opt /usr/local /srv /home /var/lib -maxdepth 4 -type f -name "act_runner" 2>/dev/null); do
           if [ -x "$p" ]; then
-            echo "$p: $($p --version 2>/dev/null || echo 'version_unknown')"
+            echo "BIN: $p ($($p --version 2>/dev/null | head -n 1 || echo 'version_unknown'))"
           fi
         done
       args:
@@ -54,20 +57,19 @@
       register: act_runner_check
       changed_when: false
       check_mode: false
+      tags: [gitea]
 
     - name: Поиск Django и ASGI в Python окружениях (BDU: 2026-07723, 2026-07722)
       ansible.builtin.shell: |
         set -o pipefail
-        echo "=== SYSTEM_PYTHON ==="
-        python3 -c "import django; print('system_django:', django.get_version())" 2>/dev/null || echo "no_system_django"
-        echo "=== VENV_DJANGO ==="
+        python3 -c "import django; print('SYSTEM_DJANGO:', django.get_version())" 2>/dev/null || echo "SYSTEM_DJANGO: none"
         for cfg in $(find /opt /var/www /srv /home /usr/local -maxdepth 5 -name "pyvenv.cfg" 2>/dev/null); do
           venv_dir=$(dirname "$cfg")
           if [ -x "$venv_dir/bin/python" ]; then
             ver=$("$venv_dir/bin/python" -c "import django; print(django.get_version())" 2>/dev/null)
             if [ -n "$ver" ]; then
-              asgi=$("$venv_dir/bin/pip" list 2>/dev/null | grep -iE 'daphne|uvicorn|hypercorn|asgiref' | tr '\n' ' ')
-              echo "$venv_dir: Django=$ver | ASGI_Pkgs=[$asgi]"
+              asgi=$("$venv_dir/bin/pip" list 2>/dev/null | grep -iE 'daphne|uvicorn|hypercorn|asgiref' | awk '{print $1":"$2}' | tr '\n' ',')
+              echo "VENV($venv_dir): Django=$ver [ASGI:${asgi:-none}]"
             fi
           fi
         done
@@ -76,6 +78,7 @@
       register: django_check
       changed_when: false
       check_mode: false
+      tags: [django]
 
     - name: Проверка Zimbra Collaboration Suite (BDU: 2022-05086)
       ansible.builtin.shell: |
@@ -89,87 +92,97 @@
       register: zimbra_check
       changed_when: false
       check_mode: false
+      tags: [zimbra]
 
     - name: Проверка GPAC / MP4Box и декодеров FFmpeg (BDU: 2026-08912, 2026-08913, 2026-08610)
       ansible.builtin.shell: |
         set -o pipefail
-        echo "=== MP4BOX ==="
         if command -v MP4Box >/dev/null 2>&1; then
-          MP4Box -version 2>&1 | head -n 3
+          echo "MP4BOX: $(MP4Box -version 2>&1 | head -n 1)"
         else
-          find /opt /usr/local -maxdepth 4 -type f -name "MP4Box" 2>/dev/null || echo "not_found"
+          found_mp4=$(find /opt /usr/local -maxdepth 4 -type f -name "MP4Box" 2>/dev/null | tr '\n' ',')
+          echo "MP4BOX: ${found_mp4:-not_found}"
         fi
-        echo "=== FFMPEG ==="
         if command -v ffmpeg >/dev/null 2>&1; then
-          ffmpeg -version 2>&1 | head -n 2
-          ffmpeg -decoders 2>/dev/null | grep -E '\b(rasc|magicyuv)\b' || echo "decoders_not_present"
+          echo "FFMPEG: $(ffmpeg -version 2>&1 | head -n 1)"
+          decs=$(ffmpeg -decoders 2>/dev/null | grep -E '\b(rasc|magicyuv)\b' | awk '{print $2}' | tr '\n' ',')
+          echo "DECODERS: ${decs:-not_present}"
         else
-          echo "ffmpeg_not_installed"
+          echo "FFMPEG: not_installed"
         fi
       args:
         executable: /bin/bash
       register: media_check
       changed_when: false
       check_mode: false
+      tags: [media]
 
     - name: Проверка Nextcloud и модуля user_oidc (BDU: 2026-08694)
       ansible.builtin.shell: |
         set -o pipefail
+        found=0
         for occ in $(find /var/www /srv /opt /home -maxdepth 4 -type f -name "occ" 2>/dev/null); do
+          found=1
           nc_dir=$(dirname "$occ")
-          echo "Found Nextcloud at: $nc_dir"
           if [ -f "$nc_dir/apps/user_oidc/appinfo/info.xml" ]; then
             ver=$(grep -oPm1 "(?<=<version>)[^<]+" "$nc_dir/apps/user_oidc/appinfo/info.xml" 2>/dev/null || echo "unknown")
-            echo "user_oidc installed, version: $ver"
+            echo "NEXTCLOUD($nc_dir): user_oidc=$ver"
           else
-            echo "user_oidc app directory not found"
+            echo "NEXTCLOUD($nc_dir): user_oidc_not_installed"
           fi
         done
+        [ "$found" -eq 0 ] && echo "nextcloud_not_found" || true
       args:
         executable: /bin/bash
       register: nextcloud_check
       changed_when: false
       check_mode: false
+      tags: [nextcloud]
 
     - name: Проверка Nginx и Squid (BDU: 2026-08881, 2026-08611)
       ansible.builtin.shell: |
         set -o pipefail
-        echo "=== NGINX ==="
         if command -v nginx >/dev/null 2>&1; then
-          nginx -V 2>&1 | tr ' ' '\n' | grep -E 'version|http_v2_module|http_grpc_module'
+          ng_v=$(nginx -v 2>&1)
+          ng_m=$(nginx -V 2>&1 | tr ' ' '\n' | grep -E 'http_v2_module|http_grpc_module' | tr '\n' ',')
+          echo "NGINX: $ng_v [Modules:${ng_m:-none}]"
         else
-          echo "nginx_not_in_path"
+          echo "NGINX: not_in_path"
         fi
-        echo "=== SQUID ==="
         if command -v squid >/dev/null 2>&1; then
-          squid -v 2>&1 | head -n 2
+          echo "SQUID: $(squid -v 2>&1 | head -n 1)"
         else
-          echo "squid_not_in_path"
+          echo "SQUID: not_in_path"
         fi
       args:
         executable: /bin/bash
       register: proxy_web_check
       changed_when: false
       check_mode: false
+      tags: [proxy_web]
 
-    - name: Формирование итоговой структуры отчета
+    - name: Формирование очищенной CSV-строки по результатам всех задач
       ansible.builtin.set_fact:
-        host_bdu_report:
-          hostname: "{{ ansible_facts.hostname }}"
-          fqdn: "{{ ansible_facts.fqdn }}"
-          os_family: "{{ ansible_facts.os_family }}"
-          distribution: "{{ ansible_facts.distribution }}"
-          distribution_version: "{{ ansible_facts.distribution_version }}"
-          kernel: "{{ ansible_facts.kernel }}"
-          matched_packages: "{{ installed_target_packages }}"
-          checks:
-            kernel_and_modules: "{{ kernel_check.stdout_lines }}"
-            gitea_act_runner: "{{ act_runner_check.stdout_lines }}"
-            django_and_asgi: "{{ django_check.stdout_lines }}"
-            zimbra: "{{ zimbra_check.stdout_lines }}"
-            gpac_and_ffmpeg: "{{ media_check.stdout_lines }}"
-            nextcloud_oidc: "{{ nextcloud_check.stdout_lines }}"
-            nginx_and_squid: "{{ proxy_web_check.stdout_lines }}"
+        host_csv_row: >-
+          {{
+            [
+              ansible_facts.hostname | default(inventory_hostname),
+              ansible_facts.fqdn | default(inventory_hostname),
+              ansible_facts.default_ipv4.address | default('N/A'),
+              ansible_facts.os_family | default('N/A'),
+              (ansible_facts.distribution | default('')) ~ ' ' ~ (ansible_facts.distribution_version | default('')),
+              ansible_facts.kernel | default('N/A'),
+              installed_target_packages | default('N/A') | regex_replace('[\r\n]+', ' | ') | regex_replace(';', ','),
+              kernel_check.stdout | default('N/A') | regex_replace('[\r\n]+', ' | ') | regex_replace(';', ','),
+              act_runner_check.stdout | default('N/A') | regex_replace('[\r\n]+', ' | ') | regex_replace(';', ','),
+              django_check.stdout | default('N/A') | regex_replace('[\r\n]+', ' | ') | regex_replace(';', ','),
+              zimbra_check.stdout | default('N/A') | regex_replace('[\r\n]+', ' | ') | regex_replace(';', ','),
+              media_check.stdout | default('N/A') | regex_replace('[\r\n]+', ' | ') | regex_replace(';', ','),
+              nextcloud_check.stdout | default('N/A') | regex_replace('[\r\n]+', ' | ') | regex_replace(';', ','),
+              proxy_web_check.stdout | default('N/A') | regex_replace('[\r\n]+', ' | ') | regex_replace(';', ',')
+            ] | map(' regex_replace', '\"', "'") | map('trim') | join(';')
+          }}
+      tags: [always]
 
     - name: Создание локальной папки для отчетов на управляющем узле
       ansible.builtin.file:
@@ -179,11 +192,31 @@
       delegate_to: localhost
       become: false
       run_once: true
+      tags: [always]
 
-    - name: Сохранение JSON-отчета по хосту на управляющий узел
+    - name: Сохранение индивидуального CSV-отчета по каждому хосту
       ansible.builtin.copy:
-        content: "{{ host_bdu_report | to_nice_json }}"
-        dest: "{{ report_output_dir }}/{{ inventory_hostname }}_bdu_audit.json"
+        content: |
+          {{ csv_header }}
+          {{ host_csv_row }}
+        dest: "{{ report_output_dir }}/{{ inventory_hostname }}_bdu_audit.csv"
         mode: '0640'
       delegate_to: localhost
       become: false
+      tags: [always]
+
+    - name: Сохранение сводного CSV-отчета по всем хостам
+      ansible.builtin.copy:
+        content: |
+          {{ csv_header }}
+          {% for host in ansible_play_hosts %}
+          {% if hostvars[host]['host_csv_row'] is defined %}
+          {{ hostvars[host]['host_csv_row'] }}
+          {% endif %}
+          {% endfor %}
+        dest: "{{ summary_csv_file }}"
+        mode: '0640'
+      delegate_to: localhost
+      become: false
+      run_once: true
+      tags: [always]
