@@ -1,0 +1,119 @@
+---
+- name: Audit CVE-2026-123158 (Alpine OpenSSH sshole) across Linux fleet and Docker
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    report_delegate_host: "adm.lin"
+    csv_report_path: "/tmp/cve_2026_123158_audit.csv"
+
+  tasks:
+    - name: Check host libc and scan running Docker containers for Alpine sshd
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -o pipefail
+
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "NO_DOCKER;N/A;N/A;N/A;N/A;N/A;N/A;NOT_AFFECTED_HOST_GLIBC"
+            exit 0
+          fi
+
+          cids=$(docker ps -q 2>/dev/null || true)
+          if [ -z "$cids" ]; then
+            echo "NO_RUNNING_CONTAINERS;N/A;N/A;N/A;N/A;N/A;N/A;NOT_AFFECTED_HOST_GLIBC"
+            exit 0
+          fi
+
+          found=0
+          for cid in $cids; do
+            alpine_ver=$(docker exec "$cid" cat /etc/alpine-release 2>/dev/null || true)
+            if [ -z "$alpine_ver" ]; then continue; fi
+
+            pkg_ver=$(docker exec "$cid" apk info -e -v openssh-server 2>/dev/null || true)
+            has_bin=$(docker exec "$cid" sh -c "command -v /usr/sbin/sshd" 2>/dev/null || true)
+
+            if [ -n "$pkg_ver" ] || [ -n "$has_bin" ]; then
+              found=1
+              {% raw %}
+              cname=$(docker inspect --format '{{.Name}}' "$cid" | sed 's|^/||')
+              cimage=$(docker inspect --format '{{.Config.Image}}' "$cid")
+              {% endraw %}
+
+              if docker top "$cid" -eo pid,comm,args 2>/dev/null | grep -q '[s]shd'; then
+                running="RUNNING"
+              else
+                running="NOT_RUNNING"
+              fi
+
+              # Получаем эффективные настройки sshd (PasswordAuthentication и UsePAM)
+              sshd_T=$(docker exec "$cid" /usr/sbin/sshd -T 2>/dev/null || true)
+              pass_auth=$(echo "$sshd_T" | awk '/^passwordauthentication /{print $2}')
+              use_pam=$(echo "$sshd_T" | awk '/^usepam /{print $2}')
+              pass_auth=${pass_auth:-yes}
+              use_pam=${use_pam:-no}
+
+              # Проверяем условия в /etc/shadow: наличие аккаунта с '*' и хотя бы одного хэша '$5$'/'$6$'
+              has_star=$(docker exec "$cid" awk -F: '$2 == "*" {print $1}' /etc/shadow 2>/dev/null | paste -sd "," - || true)
+              has_hash=$(docker exec "$cid" awk -F: '$2 ~ /^\$[56]\$/ {print $1}' /etc/shadow 2>/dev/null | paste -sd "," - || true)
+
+              if [ -n "$has_star" ] && [ -n "$has_hash" ]; then
+                shadow_cond="EXPLOITABLE_SHADOW(star:${has_star}|salt:${has_hash})"
+              else
+                shadow_cond="SAFE_SHADOW(star:${has_star:-none}|salt:${has_hash:-none})"
+              fi
+
+              # Сверка версии пакета с пропатченными релизами от 05.11.2026
+              branch=$(echo "$alpine_ver" | cut -d. -f1,2)
+              case "$branch" in
+                3.24) fix="10.3_p1-r2" ;;
+                3.23) fix="10.2_p1-r1" ;;
+                3.22) fix="10.0_p1-r11" ;;
+                3.21) fix="9.9_p2-r1" ;;
+                3.20) fix="9.7_p1-r6" ;;
+                3.19) fix="9.6_p1-r3" ;;
+                3.18) fix="9.3_p2-r4" ;;
+                3.17) fix="9.1_p1-r7" ;;
+                3.16) fix="9.0_p1-r6" ;;
+                *)    fix="10.6_p2-r0" ;;
+              esac
+
+              cur_ver=${pkg_ver#openssh-server-}
+              cmp=$(docker exec "$cid" apk version -t "$cur_ver" "$fix" 2>/dev/null || echo "?")
+
+              if [ "$cmp" = "<" ]; then
+                if [ "$running" = "RUNNING" ] && [ "$pass_auth" = "yes" ] && [ "$use_pam" = "no" ] && [[ "$shadow_cond" == EXPLOITABLE_SHADOW* ]]; then
+                  status="CRITICAL_EXPLOITABLE_NOW"
+                elif [ "$running" = "RUNNING" ] && [ "$pass_auth" = "yes" ]; then
+                  status="VULNERABLE_PKG_NO_SALT_IN_SHADOW"
+                else
+                  status="VULNERABLE_PKG_MITIGATED"
+                fi
+              else
+                status="PATCHED_SAFE"
+              fi
+
+              echo "${cname};${cimage};${alpine_ver};${pkg_ver:-manual_binary};${running};PassAuth:${pass_auth}/PAM:${use_pam};${shadow_cond};${status}"
+            fi
+          done
+
+          if [ "$found" -eq 0 ]; then
+            echo "NO_ALPINE_SSHD_CONTAINERS;N/A;N/A;N/A;N/A;N/A;N/A;NOT_AFFECTED"
+          fi
+      register: docker_audit
+      changed_when: false
+
+    - name: Write consolidated CSV report to central host
+      ansible.builtin.copy:
+        dest: "{{ csv_report_path }}"
+        mode: "0644"
+        content: |
+          Hostname;Host_OS;Host_Status;Container_Name;Image;Alpine_Version;OpenSSH_Package;SSHD_Process;SSHD_Auth_Config;Shadow_Preconditions;Final_Verdict
+          {% for host in ansible_play_hosts %}
+          {% set host_os = hostvars[host]['ansible_distribution'] ~ ' ' ~ hostvars[host]['ansible_distribution_version'] %}
+          {% for line in hostvars[host]['docker_audit']['stdout_lines'] | default(['ERROR_NO_DATA;N/A;N/A;N/A;N/A;N/A;N/A;UNKNOWN']) %}
+          {{ host }};{{ host_os }};Not Affected (glibc+PAM);{{ line }}
+          {% endfor %}
+          {% endfor %}
+      delegate_to: "{{ report_delegate_host }}"
+      run_once: true
