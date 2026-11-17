@@ -1,0 +1,105 @@
+---
+- name: Аудит dbu от 16.07.2026
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    report_host: "adm.lin"
+    report_file: "/tmp/cve_audit_report_{{ ansible_date_time.date }}.csv"
+
+  tasks:
+    - name: Сбор информации об установленных пакетах
+      package_facts:
+        manager: auto
+      tags: always
+
+    - name: Инициализация файла отчета с UTF-8 BOM на adm.lin
+      delegate_to: "{{ report_host }}"
+      run_once: true
+      copy:
+        # Символ \uFEFF обеспечивает корректное открытие кириллицы в Excel
+        content: "\uFEFFHostname;OS;CVE;Component;Verdict\n"
+        dest: "{{ report_file }}"
+
+    - name: Проверка конфигурационных путей веб-приложений (FreePBX, Moodle)
+      stat:
+        path: "{{ item }}"
+      loop:
+        - /etc/freepbx.conf
+        - /var/www/html/moodle/version.php
+      register: paths_check
+
+    - name: Проверка запущенных контейнеров Metabase (CVE-2023-38646)
+      command: docker ps --filter "ancestor=metabase/metabase" -q
+      register: metabase_docker
+      ignore_errors: true
+      changed_when: false
+
+    - name: Проверка установленной версии Helm (CVE-2026-35204)
+      command: helm version --short
+      register: helm_check
+      ignore_errors: true
+      changed_when: false
+
+    - name: Формирование результатов аудита
+      set_fact:
+        audit_results:
+          - cve: "CVE-2025-57819"
+            comp: "FreePBX"
+            status: "{{ 'DETECTED (Path)' if paths_check.results[0].stat.exists else 'NOT_FOUND' }}"
+          - cve: "CVE-2024-42009"
+            comp: "Roundcube"
+            status: "{{ 'DETECTED (Pkg)' if 'roundcubemail' in ansible_facts.packages else 'NOT_FOUND' }}"
+          - cve: "CVE-2026-23490"
+            comp: "pyasn1"
+            status: "{{ 'DETECTED (Pkg)' if ('python3-pyasn1' in ansible_facts.packages or 'python-pyasn1' in ansible_facts.packages) else 'NOT_FOUND' }}"
+          - cve: "CVE-2026-8451"
+            comp: "NetScaler ADC"
+            status: "MANUAL_CHECK (Appliance)"
+          - cve: "CVE-2026-8655"
+            comp: "NetScaler ADC"
+            status: "MANUAL_CHECK (Appliance)"
+          - cve: "CVE-2023-38646"
+            comp: "Metabase"
+            status: "{{ 'DETECTED (Docker)' if (metabase_docker.rc == 0 and metabase_docker.stdout | length > 0) else 'NOT_FOUND' }}"
+          - cve: "CVE-2026-10520"
+            comp: "Ivanti Sentry"
+            status: "MANUAL_CHECK (Appliance)"
+          - cve: "CVE-2026-43515"
+            comp: "Apache Tomcat"
+            status: "{{ 'DETECTED (Pkg)' if ('tomcat' in ansible_facts.packages or 'tomcat9' in ansible_facts.packages) else 'NOT_FOUND' }}"
+          - cve: "CVE-2026-40047"
+            comp: "Apache Camel Docling"
+            status: "MANUAL_CHECK (Java lib)"
+          - cve: "CVE-2026-43866"
+            comp: "Apache Camel JMS"
+            status: "MANUAL_CHECK (Java lib)"
+          - cve: "CVE-2026-35204"
+            comp: "Helm"
+            status: "{{ 'DETECTED' if (helm_check.rc == 0) else 'NOT_FOUND' }}"
+          - cve: "CVE-2026-53359"
+            comp: "KVM (Januscape)"
+            status: "{{ 'DETECTED (Pkg)' if ('qemu-kvm' in ansible_facts.packages or 'pve-qemu-kvm' in ansible_facts.packages) else 'NOT_FOUND' }}"
+          - cve: "CVE-2023-54316"
+            comp: "Unknown Component"
+            status: "MANUAL_CHECK (NVD TBD)"
+          - cve: "CVE-2026-46331"
+            comp: "Linux Kernel (Root Exploit)"
+            status: "KERNEL: {{ ansible_kernel }}"
+          - cve: "CVE-2021-3560"
+            comp: "polkit"
+            status: "{{ 'DETECTED (Pkg)' if 'polkit' in ansible_facts.packages else 'NOT_FOUND' }}"
+          - cve: "CVE-2025-26529"
+            comp: "Moodle"
+            status: "{{ 'DETECTED (Path)' if paths_check.results[1].stat.exists else 'NOT_FOUND' }}"
+          - cve: "CVE-2025-21765"
+            comp: "Linux Kernel (IPv6 RCU)"
+            status: "KERNEL: {{ ansible_kernel }}"
+
+    - name: Построчное добавление результатов в CSV на adm.lin
+      delegate_to: "{{ report_host }}"
+      lineinfile:
+        path: "{{ report_file }}"
+        line: "{{ inventory_hostname }};{{ ansible_distribution }} {{ ansible_distribution_version }};{{ item.cve }};{{ item.comp }};{{ item.status }}"
+        create: yes
+      loop: "{{ audit_results }}"
