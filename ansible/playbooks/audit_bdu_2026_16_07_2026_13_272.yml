@@ -1,105 +1,207 @@
 ---
-- name: Аудит dbu от 16.07.2026
+- name: Безопасный аудит инфраструктуры (Хосты + Docker-контейнеры)
   hosts: all
-  become: true
+  become: false
   gather_facts: true
   vars:
     report_host: "adm.lin"
-    report_file: "/tmp/cve_audit_report_{{ ansible_date_time.date }}.csv"
+    report_dir: "/var/log/cve_audit"
+    report_file: "{{ report_dir }}/cve_audit_report_{{ ansible_date_time.date }}.csv"
 
   tasks:
-    - name: Сбор информации об установленных пакетах
-      package_facts:
-        manager: auto
-      tags: always
-
-    - name: Инициализация файла отчета с UTF-8 BOM на adm.lin
+    # ==========================================
+    # 1. ПОДГОТОВКА КАТАЛОГА ОТЧЕТОВ НА ADM.LIN
+    # ==========================================
+    - name: Создание защищенного каталога отчетов на adm.lin
       delegate_to: "{{ report_host }}"
       run_once: true
-      copy:
-        # Символ \uFEFF обеспечивает корректное открытие кириллицы в Excel
-        content: "\uFEFFHostname;OS;CVE;Component;Verdict\n"
-        dest: "{{ report_file }}"
+      ansible.builtin.file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: "0700"
 
-    - name: Проверка конфигурационных путей веб-приложений (FreePBX, Moodle)
-      stat:
+    # ==========================================
+    # 2. СБОР ДАННЫХ НА ХОСТЕ (MINIMAL PRIVILEGE)
+    # ==========================================
+    - name: Сбор информации об установленных пакетах хоста
+      become: true
+      ansible.builtin.package_facts:
+        manager: auto
+      register: pkg_facts_res
+      failed_when: false
+
+    - name: Проверка конфигурационных путей (FreePBX, Moodle) на хосте
+      become: true
+      ansible.builtin.stat:
         path: "{{ item }}"
       loop:
         - /etc/freepbx.conf
         - /var/www/html/moodle/version.php
-      register: paths_check
+      register: host_paths_check
 
-    - name: Проверка запущенных контейнеров Metabase (CVE-2023-38646)
-      command: docker ps --filter "ancestor=metabase/metabase" -q
-      register: metabase_docker
-      ignore_errors: true
+    - name: Проверка установленной версии Helm на хосте
+      ansible.builtin.command:
+        cmd: helm version --short
+      register: host_helm_check
+      failed_when: false
       changed_when: false
 
-    - name: Проверка установленной версии Helm (CVE-2026-35204)
-      command: helm version --short
-      register: helm_check
-      ignore_errors: true
+    # ==========================================
+    # 3. ПАКЕТНАЯ ИНСПЕКЦИЯ DOCKER (1 ВЫЗОВ НА ХОСТ)
+    # ==========================================
+    - name: Единый проход инспекции всех запущенных Docker-контейнеров
+      become: true
+      ansible.builtin.shell:
+        executable: /bin/sh
+        cmd: |
+          set -u
+          if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+            docker ps --format '{{ '{{' }}.ID{{ '}}' }}|{{ '{{' }}.Names{{ '}}' }}|{{ '{{' }}.Image{{ '}}' }}' | while IFS='|' read -r cid cname cimage; do
+              case "$cimage" in
+                *metabase*) echo "HIT|METABASE|$cname ($cimage)" ;;
+              esac
+              docker exec "$cid" sh -c '
+                [ -f /etc/freepbx.conf ] && echo "HIT|FREEPBX"
+                [ -f /var/www/html/moodle/version.php ] && echo "HIT|MOODLE"
+                if command -v dpkg-query >/dev/null 2>&1; then
+                  dpkg-query -W -f="${Package}=${Version}\n" 2>/dev/null | grep -iE "^(roundcubemail|python3?-pyasn1|tomcat[0-9]*|polkit)=" | sed "s/^/HIT|PKG|/"
+                elif command -v rpm >/dev/null 2>&1; then
+                  rpm -qa --qf "%{NAME}=%{VERSION}-%{RELEASE}\n" 2>/dev/null | grep -iE "^(roundcubemail|python3?-pyasn1|tomcat[0-9]*|polkit)=" | sed "s/^/HIT|PKG|/"
+                elif command -v apk >/dev/null 2>&1; then
+                  apk info -v 2>/dev/null | grep -iE "^(roundcubemail|py3?-pyasn1|tomcat|polkit)-" | sed "s/^/HIT|PKG|/"
+                fi
+              ' 2>/dev/null | sed "s/$/|$cname/"
+            done
+          fi
+      register: container_scan
+      failed_when: false
       changed_when: false
 
-    - name: Формирование результатов аудита
-      set_fact:
+    # ==========================================
+    # 4. АНАЛИЗ ВЕРСИЙ И ФОРМИРОВАНИЕ ВЕРДИКТОВ
+    # ==========================================
+    - name: Подготовка промежуточных фактов по хосту и контейнерам
+      ansible.builtin.set_fact:
+        audit_os: "{{ ansible_distribution | default('Unknown') }} {{ ansible_distribution_version | default('') }}"
+        pkgs: "{{ ansible_facts.packages | default({}) }}"
+        c_lines: "{{ container_scan.stdout_lines | default([]) }}"
+
+    - name: Извлечение совпадений из контейнеров
+      ansible.builtin.set_fact:
+        c_freepbx: "{{ c_lines | select('match', '^HIT\\|FREEPBX\\|') | map('regex_replace', '^HIT\\|FREEPBX\\|(.*)$', '\\1') | unique | list }}"
+        c_moodle: "{{ c_lines | select('match', '^HIT\\|MOODLE\\|') | map('regex_replace', '^HIT\\|MOODLE\\|(.*)$', '\\1') | unique | list }}"
+        c_metabase: "{{ c_lines | select('match', '^HIT\\|METABASE\\|') | map('regex_replace', '^HIT\\|METABASE\\|(.*)$', '\\1') | unique | list }}"
+        c_roundcube: "{{ c_lines | select('match', '^HIT\\|PKG\\|roundcubemail') | map('regex_replace', '^HIT\\|PKG\\|(.*)\\|(.*)$', '\\1 [container: \\2]') | list }}"
+        c_pyasn1: "{{ c_lines | select('match', '^HIT\\|PKG\\|(python3?-|py3?-)pyasn1') | map('regex_replace', '^HIT\\|PKG\\|(.*)\\|(.*)$', '\\1 [container: \\2]') | list }}"
+        c_tomcat: "{{ c_lines | select('match', '^HIT\\|PKG\\|tomcat') | map('regex_replace', '^HIT\\|PKG\\|(.*)\\|(.*)$', '\\1 [container: \\2]') | list }}"
+        c_polkit: "{{ c_lines | select('match', '^HIT\\|PKG\\|polkit') | map('regex_replace', '^HIT\\|PKG\\|(.*)\\|(.*)$', '\\1 [container: \\2]') | list }}"
+
+    - name: Формирование финальных вердиктов по CVE для хоста
+      ansible.builtin.set_fact:
         audit_results:
           - cve: "CVE-2025-57819"
             comp: "FreePBX"
-            status: "{{ 'DETECTED (Path)' if paths_check.results[0].stat.exists else 'NOT_FOUND' }}"
+            status: "{{ 'DETECTED' if (host_paths_check.results[0].stat.exists or c_freepbx | length > 0) else 'NOT_FOUND' }}"
+            details: "{{ ('Host: /etc/freepbx.conf ' if host_paths_check.results[0].stat.exists else '') + ('Containers: ' + (c_freepbx | join(', ')) if c_freepbx | length > 0 else '') }}"
+
           - cve: "CVE-2024-42009"
             comp: "Roundcube"
-            status: "{{ 'DETECTED (Pkg)' if 'roundcubemail' in ansible_facts.packages else 'NOT_FOUND' }}"
+            status: "{{ 'DETECTED' if ('roundcubemail' in pkgs or c_roundcube | length > 0) else 'NOT_FOUND' }}"
+            details: "{{ ('Host: ' + pkgs['roundcubemail'][0].version + ' ' if 'roundcubemail' in pkgs else '') + (c_roundcube | join(', ')) }}"
+
           - cve: "CVE-2026-23490"
             comp: "pyasn1"
-            status: "{{ 'DETECTED (Pkg)' if ('python3-pyasn1' in ansible_facts.packages or 'python-pyasn1' in ansible_facts.packages) else 'NOT_FOUND' }}"
+            status: "{{ 'DETECTED' if ('python3-pyasn1' in pkgs or 'python-pyasn1' in pkgs or c_pyasn1 | length > 0) else 'NOT_FOUND' }}"
+            details: "{{ ('Host: ' + (pkgs['python3-pyasn1'][0].version if 'python3-pyasn1' in pkgs else pkgs['python-pyasn1'][0].version) + ' ' if ('python3-pyasn1' in pkgs or 'python-pyasn1' in pkgs) else '') + (c_pyasn1 | join(', ')) }}"
+
           - cve: "CVE-2026-8451"
             comp: "NetScaler ADC"
-            status: "MANUAL_CHECK (Appliance)"
+            status: "MANUAL_CHECK"
+            details: "Proprietary Appliance"
+
           - cve: "CVE-2026-8655"
             comp: "NetScaler ADC"
-            status: "MANUAL_CHECK (Appliance)"
+            status: "MANUAL_CHECK"
+            details: "Proprietary Appliance"
+
           - cve: "CVE-2023-38646"
             comp: "Metabase"
-            status: "{{ 'DETECTED (Docker)' if (metabase_docker.rc == 0 and metabase_docker.stdout | length > 0) else 'NOT_FOUND' }}"
+            status: "{{ 'DETECTED' if c_metabase | length > 0 else 'NOT_FOUND' }}"
+            details: "{{ c_metabase | join(', ') }}"
+
           - cve: "CVE-2026-10520"
             comp: "Ivanti Sentry"
-            status: "MANUAL_CHECK (Appliance)"
+            status: "MANUAL_CHECK"
+            details: "Proprietary Appliance"
+
           - cve: "CVE-2026-43515"
             comp: "Apache Tomcat"
-            status: "{{ 'DETECTED (Pkg)' if ('tomcat' in ansible_facts.packages or 'tomcat9' in ansible_facts.packages) else 'NOT_FOUND' }}"
+            status: "{{ 'DETECTED' if ('tomcat' in pkgs or 'tomcat9' in pkgs or c_tomcat | length > 0) else 'NOT_FOUND' }}"
+            details: "{{ ('Host: ' + (pkgs['tomcat'][0].version if 'tomcat' in pkgs else pkgs['tomcat9'][0].version) + ' ' if ('tomcat' in pkgs or 'tomcat9' in pkgs) else '') + (c_tomcat | join(', ')) }}"
+
           - cve: "CVE-2026-40047"
             comp: "Apache Camel Docling"
-            status: "MANUAL_CHECK (Java lib)"
+            status: "MANUAL_CHECK"
+            details: "Java JAR/WAR artifact check"
+
           - cve: "CVE-2026-43866"
             comp: "Apache Camel JMS"
-            status: "MANUAL_CHECK (Java lib)"
+            status: "MANUAL_CHECK"
+            details: "Java JAR/WAR artifact check"
+
           - cve: "CVE-2026-35204"
             comp: "Helm"
-            status: "{{ 'DETECTED' if (helm_check.rc == 0) else 'NOT_FOUND' }}"
+            status: "{{ 'DETECTED' if host_helm_check.rc | default(1) == 0 else 'NOT_FOUND' }}"
+            details: "{{ host_helm_check.stdout | default('') | trim }}"
+
           - cve: "CVE-2026-53359"
             comp: "KVM (Januscape)"
-            status: "{{ 'DETECTED (Pkg)' if ('qemu-kvm' in ansible_facts.packages or 'pve-qemu-kvm' in ansible_facts.packages) else 'NOT_FOUND' }}"
+            status: "{{ 'DETECTED' if ('qemu-kvm' in pkgs or 'pve-qemu-kvm' in pkgs) else 'NOT_FOUND' }}"
+            details: "{{ (pkgs['qemu-kvm'][0].version if 'qemu-kvm' in pkgs else pkgs['pve-qemu-kvm'][0].version) if ('qemu-kvm' in pkgs or 'pve-qemu-kvm' in pkgs) else '' }}"
+
           - cve: "CVE-2023-54316"
             comp: "Unknown Component"
-            status: "MANUAL_CHECK (NVD TBD)"
+            status: "MANUAL_CHECK"
+            details: "NVD TBD"
+
           - cve: "CVE-2026-46331"
-            comp: "Linux Kernel (Root Exploit)"
-            status: "KERNEL: {{ ansible_kernel }}"
+            comp: "Linux Kernel"
+            status: "CHECK_KERNEL"
+            details: "{{ ansible_kernel | default('UNKNOWN') }}"
+
           - cve: "CVE-2021-3560"
             comp: "polkit"
-            status: "{{ 'DETECTED (Pkg)' if 'polkit' in ansible_facts.packages else 'NOT_FOUND' }}"
+            status: "{{ 'DETECTED' if ('polkit' in pkgs or c_polkit | length > 0) else 'NOT_FOUND' }}"
+            details: "{{ ('Host: ' + pkgs['polkit'][0].version + ' ' if 'polkit' in pkgs else '') + (c_polkit | join(', ')) }}"
+
           - cve: "CVE-2025-26529"
             comp: "Moodle"
-            status: "{{ 'DETECTED (Path)' if paths_check.results[1].stat.exists else 'NOT_FOUND' }}"
-          - cve: "CVE-2025-21765"
-            comp: "Linux Kernel (IPv6 RCU)"
-            status: "KERNEL: {{ ansible_kernel }}"
+            status: "{{ 'DETECTED' if (host_paths_check.results[1].stat.exists or c_moodle | length > 0) else 'NOT_FOUND' }}"
+            details: "{{ ('Host: /var/www/html/moodle/version.php ' if host_paths_check.results[1].stat.exists else '') + ('Containers: ' + (c_moodle | join(', ')) if c_moodle | length > 0 else '') }}"
 
-    - name: Построчное добавление результатов в CSV на adm.lin
+          - cve: "CVE-2025-21765"
+            comp: "Linux Kernel (IPv6)"
+            status: "CHECK_KERNEL"
+            details: "{{ ansible_kernel | default('UNKNOWN') }}"
+
+    # ==========================================
+    # 5. АТОМАРНАЯ ЗАПИСЬ ОТЧЕТА БЕЗ RACE CONDITION
+    # ==========================================
+    - name: Атомарная сборка итогового CSV-отчета на adm.lin
       delegate_to: "{{ report_host }}"
-      lineinfile:
-        path: "{{ report_file }}"
-        line: "{{ inventory_hostname }};{{ ansible_distribution }} {{ ansible_distribution_version }};{{ item.cve }};{{ item.comp }};{{ item.status }}"
-        create: yes
-      loop: "{{ audit_results }}"
+      run_once: true
+      ansible.builtin.copy:
+        dest: "{{ report_file }}"
+        mode: "0600"
+        content: |-
+          {{ '\uFEFF' }}Hostname;OS;CVE;Component;Verdict;Details
+          {% for host in ansible_play_hosts_all %}
+          {% set hv = hostvars[host] %}
+          {% if hv.audit_results is defined %}
+          {% for item in hv.audit_results %}
+          {{ host }};{{ hv.audit_os | default('Unknown') }};{{ item.cve }};{{ item.comp }};{{ item.status }};{{ item.details | default('') | regex_replace('[\r\n;]+', ' ') | regex_replace('^[=+\\-@]', "'\\0") }}
+          {% endfor %}
+          {% else %}
+          {{ host }};UNREACHABLE;ALL;Host Audit;ERROR;Host unreachable or failed during data collection
+          {% endif %}
+          {% endfor %}
