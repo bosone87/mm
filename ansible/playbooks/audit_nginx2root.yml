@@ -15,12 +15,10 @@
       run_once: true
       delegate_to: localhost
       delegate_facts: true
-      check_mode: false
 
     - name: Задать путь к итоговому CSV-файлу
       ansible.builtin.set_fact:
         report_file: "{{ report_dir }}/nginx2root_audit_{{ hostvars['localhost']['audit_timestamp'] }}.csv"
-      check_mode: false
 
     - name: Выполнить read-only сбор данных по NGINX и SCTP на хосте и в контейнерах
       ansible.builtin.shell:
@@ -37,7 +35,42 @@
             fi
           }
 
-          # 1. Проверка модуля SCTP на ядре хоста (общее для хоста и контейнеров)
+          is_patched() {
+            local maj min pat
+            IFS='.' read -r maj min pat _ <<< "$1"
+            [[ "$maj" =~ ^[0-9]+$ && "$min" =~ ^[0-9]+$ && "$pat" =~ ^[0-9]+$ ]] || return 1
+            if [ "$maj" -gt 1 ] || { [ "$maj" -eq 1 ] && [ "$min" -ge 32 ]; }; then return 0; fi
+            if [ "$maj" -eq 1 ] && [ "$min" -eq 30 ] && [ "$pat" -ge 7 ]; then return 0; fi
+            if [ "$maj" -eq 1 ] && [ "$min" -eq 31 ] && [ "$pat" -ge 9 ]; then return 0; fi
+            return 1
+          }
+
+          calc_risk() {
+            local has_ngx="$1" ver="$2" h2="$3" h3="$4" mail="$5" dyn="$6" mir="$7" ssi="$8" sctp_l="$9"
+            if [ "$has_ngx" = "NO" ]; then
+              [[ "$sctp_l" == YES* ]] && echo "MEDIUM_SCTP_LOADED_NO_NGINX" || echo "LOW_NO_NGINX"
+              return
+            fi
+            if [ "$has_ngx" = "NO_SHELL_OR_BIN" ]; then
+              echo "REVIEW_DISTROLESS_CONTAINER"
+              return
+            fi
+            if is_patched "$ver"; then
+              [[ "$sctp_l" == YES* ]] && echo "LOW_NGINX_PATCHED_CHECK_SCTP" || echo "OK_PATCHED"
+              return
+            fi
+            if [ "$h2" = "YES" ] || [ "$h3" = "YES" ] || [ "$mail" = "YES" ] || { [ "$dyn" = "YES" ] && { [ "$mir" = "YES" ] || [ "$ssi" = "YES" ]; }; }; then
+              [[ "$sctp_l" == YES* ]] && echo "CRITICAL_ACTIVE_VECTOR_AND_SCTP" || echo "CRITICAL_ACTIVE_VECTOR"
+              return
+            fi
+            if [ "$h2" = "ERR" ]; then
+              echo "REVIEW_NGINX_CFG_ERROR"
+              return
+            fi
+            echo "MEDIUM_VULN_VER_NO_ACTIVE_VECTOR"
+          }
+
+          # 1. Проверка модуля SCTP на ядре хоста
           SCTP_LOADED="NO"
           if lsmod 2>/dev/null | awk '$1 == "sctp" { found=1 } END { exit (found ? 0 : 1) }'; then
             SCTP_LOADED="YES"
@@ -45,10 +78,10 @@
             SCTP_LOADED="YES_SYSFS"
           fi
 
-          MODPROBE_HITS=$(grep -rnE '^[[:space:]]*(blacklist|install)[[:space:]]+sctp\b' /etc/modprobe.d/ 2>/dev/null | tr '\n' ';' | sed 's/;$//')
+          MODPROBE_HITS=$(grep -rnE '^[[:space:]]*(blacklist|install)[[:space:]]+sctp\b' /etc/modprobe.d/ 2>/dev/null | tr '\n' ',' | sed 's/,$//')
           [ -z "$MODPROBE_HITS" ] && MODPROBE_HITS="NONE"
 
-          # 2. Анализ конфигурации NGINX без учёта закомментированных строк
+          # 2. Анализ конфигурации NGINX без учёта комментариев
           analyze_nginx_cfg() {
             local CLEAN_CFG
             CLEAN_CFG=$(printf '%s\n' "$1" | sed -E 's/^[[:space:]]*#.*$//')
@@ -63,7 +96,7 @@
             printf "%s%s%s%s%s%s%s%s%s%s%s%s%s" "$H2" "$SEP" "$H3" "$SEP" "$MAIL" "$SEP" "$DYN" "$SEP" "$MIR" "$SEP" "$SSI" "$SEP" "$RES"
           }
 
-          # 3. Разбор версии и собранных модулей NGINX
+          # 3. Разбор версии и модулей NGINX
           parse_nginx_v() {
             local V_OUT="$1"
             local VER V2 V3 ML
@@ -72,14 +105,16 @@
             printf '%s' "$V_OUT" | grep -q -- '--with-http_v2_module' && V2="Y" || V2="N"
             printf '%s' "$V_OUT" | grep -q -- '--with-http_v3_module' && V3="Y" || V3="N"
             printf '%s' "$V_OUT" | grep -q -- '--with-mail' && ML="Y" || ML="N"
-            printf "%s%sv2=%s;v3=%s;mail=%s" "$VER" "$SEP" "$V2" "$V3" "$ML"
+            printf "%s%sv2=%s,v3=%s,mail=%s" "$VER" "$SEP" "$V2" "$V3" "$ML"
           }
 
           emit_row() {
-            printf "%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n" \
+            local RISK
+            RISK=$(calc_risk "$3" "$4" "$6" "$7" "$8" "$9" "${10}" "${11}" "${13}")
+            printf "%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n" \
               "$1" "$SEP" "$2" "$SEP" "$3" "$SEP" "$4" "$SEP" "$5" "$SEP" \
               "$6" "$SEP" "$7" "$SEP" "$8" "$SEP" "$9" "$SEP" "${10}" "$SEP" \
-              "${11}" "$SEP" "${12}" "$SEP" "${13}" "$SEP" "${14}"
+              "${11}" "$SEP" "${12}" "$SEP" "${13}" "$SEP" "${14}" "$SEP" "$RISK"
           }
 
           # 4. Аудит хоста
@@ -122,7 +157,7 @@
                 elif [ "$HAS_NGX" = "IMAGE_MATCH" ]; then
                   emit_row "${RT}:${CNAME}" "$CIMAGE" "NO_SHELL_OR_BIN" "N/A" "N/A" "N/A" "N/A" "N/A" "N/A" "N/A" "N/A" "N/A" "$SCTP_LOADED" "$MODPROBE_HITS"
                 fi
-              done < <(run_to "$RT" ps --format '{{.ID}}\t{{.Names}}\t{{.Image}}' 2>/dev/null || true)
+              done < <(run_to "$RT" ps --format '{% raw %}{{.ID}}\t{{.Names}}\t{{.Image}}{% endraw %}' 2>/dev/null || true)
             fi
           done
       args:
@@ -141,131 +176,77 @@
       run_once: true
       check_mode: false
 
-    - name: Записать результаты аудита в CSV (UTF-8 с BOM) на adm.lin с блокировкой файла
-      ansible.builtin.shell:
-        cmd: |
-          python3 - <<'PYEOF'
-          import csv
-          import fcntl
-          import os
-
-          path = os.environ["REPORT_FILE"]
-          sep = "\x1f"
-
-          def safe_cell(val: str) -> str:
-              s = str(val if val is not None else "").replace("\r", " ").replace("\n", " ")
-              if s.startswith(("=", "+", "-", "@", "\t")):
-                  s = "'" + s
-              return s
-
-          def is_nginx_patched(ver: str) -> bool:
-              try:
-                  parts = tuple(int(x) for x in ver.split(".")[:3])
-                  if len(parts) < 3:
-                      return False
-                  if parts[0] == 1 and parts[1] == 30 and parts[2] >= 7:
-                      return True
-                  if parts[0] == 1 and parts[1] == 31 and parts[2] >= 9:
-                      return True
-                  if parts >= (1, 32, 0):
-                      return True
-                  return False
-              except ValueError:
-                  return False
-
-          def calc_risk(has_ngx, ver, h2, h3, mail, dyn, mir, ssi, sctp_l):
-              if has_ngx == "NO":
-                  return "MEDIUM_SCTP_LOADED_NO_NGINX" if sctp_l.startswith("YES") else "LOW_NO_NGINX"
-              if has_ngx == "NO_SHELL_OR_BIN":
-                  return "REVIEW_DISTROLESS_CONTAINER"
-              if is_nginx_patched(ver):
-                  return "LOW_NGINX_PATCHED_CHECK_SCTP" if sctp_l.startswith("YES") else "OK_PATCHED"
-              if h2 == "YES" or h3 == "YES" or mail == "YES" or (dyn == "YES" and (mir == "YES" or ssi == "YES")):
-                  return "CRITICAL_ACTIVE_VECTOR_AND_SCTP" if sctp_l.startswith("YES") else "CRITICAL_ACTIVE_VECTOR"
-              if h2 == "ERR":
-                  return "REVIEW_NGINX_CFG_ERROR"
-              return "MEDIUM_VULN_VER_NO_ACTIVE_VECTOR"
-
-          raw_lines = [line for line in os.environ.get("RAW_LINES", "").splitlines() if line.strip()]
-          rows = []
-          for line in raw_lines:
-              parts = line.split(sep)
-              if len(parts) < 14:
-                  continue
-              target, img, has_ngx, ver, mods, h2, h3, mail, dyn, mir, ssi, res, sctp_l, sctp_m = parts[:14]
-              risk = calc_risk(has_ngx, ver, h2, h3, mail, dyn, mir, ssi, sctp_l)
-              rows.append([
-                  safe_cell(os.environ["H_NAME"]),
-                  safe_cell(os.environ["H_IP"]),
-                  safe_cell(os.environ["H_OS"]),
-                  safe_cell(os.environ["H_KERNEL"]),
-                  safe_cell(target),
-                  safe_cell(img),
-                  safe_cell(has_ngx),
-                  safe_cell(ver),
-                  safe_cell(mods),
-                  safe_cell(h2),
-                  safe_cell(h3),
-                  safe_cell(mail),
-                  safe_cell(dyn),
-                  safe_cell(mir),
-                  safe_cell(ssi),
-                  safe_cell(res),
-                  safe_cell(sctp_l),
-                  safe_cell(sctp_m),
-                  safe_cell(risk),
-              ])
-
-          os.umask(0o027)
-          with open(path, "a+", newline="", encoding="utf-8") as f:
-              fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-              f.seek(0, os.SEEK_END)
-              is_empty = f.tell() == 0
-              if is_empty:
-                  f.write("\ufeff")
-              writer = csv.writer(f, delimiter=";", quoting=csv.QUOTE_MINIMAL)
-              if is_empty:
-                  writer.writerow([
-                      "host",
-                      "ip",
-                      "os_distribution",
-                      "kernel",
-                      "target",
-                      "image_or_bin",
-                      "nginx_found",
-                      "nginx_version",
-                      "nginx_modules",
-                      "http2_active",
-                      "http3_quic_active",
-                      "mail_block_active",
-                      "dyn_proxy_pass",
-                      "mirror_active",
-                      "ssi_on_active",
-                      "resolver_active",
-                      "sctp_loaded",
-                      "sctp_modprobe_rules",
-                      "risk_status",
-                  ])
-              for r in rows:
-                  writer.writerow(r)
-              f.flush()
-              os.fsync(f.fileno())
-              fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-          PYEOF
-      environment:
-        REPORT_FILE: "{{ report_file }}"
-        H_NAME: "{{ inventory_hostname }}"
-        H_IP: "{{ ansible_default_ipv4.address | default('N/A') }}"
-        H_OS: "{{ ansible_distribution | default('N/A') }} {{ ansible_distribution_version | default('') }}"
-        H_KERNEL: "{{ ansible_kernel | default('N/A') }}"
-        RAW_LINES: "{{ audit_rows.stdout | default('') }}"
+    - name: Сохранить единый CSV-отчёт (UTF-8 с BOM) на adm.lin через ansible.builtin.copy
+      ansible.builtin.copy:
+        dest: "{{ report_file }}"
+        mode: "0640"
+        content: |
+          {%- macro cell(val) -%}
+            {%- set s = (val | default('') | string | replace('\r', ' ') | replace('\n', ' ')) -%}
+            {%- if s[:1] in ['=', '+', '-', '@', '\t'] -%}
+              {%- set s = "'" ~ s -%}
+            {%- endif -%}
+            {%- if ';' in s or '"' in s -%}
+              "{{ s | replace('"', '""') }}"
+            {%- else -%}
+              {{ s }}
+            {%- endif -%}
+          {%- endmacro -%}
+          {{ '\ufeff' }}host;ip;os_distribution;kernel;target;image_or_bin;nginx_found;nginx_version;nginx_modules;http2_active;http3_quic_active;mail_block_active;dyn_proxy_pass;mirror_active;ssi_on_active;resolver_active;sctp_loaded;sctp_modprobe_rules;risk_status
+          {% for h in ansible_play_hosts %}
+          {% set hv = hostvars[h] %}
+          {% set h_ip = (hv.ansible_default_ipv4.address if (hv.ansible_default_ipv4 is defined and hv.ansible_default_ipv4.address is defined) else 'N/A') %}
+          {% set h_os = (hv.ansible_distribution | default('N/A')) ~ ' ' ~ (hv.ansible_distribution_version | default('')) %}
+          {% set h_kernel = hv.ansible_kernel | default('N/A') %}
+          {% if hv.audit_rows is defined and hv.audit_rows.stdout_lines is defined %}
+          {% for line in hv.audit_rows.stdout_lines if line | trim | length > 0 %}
+          {% set p = line.split('\x1f') %}
+          {% if p | length >= 15 %}
+          {{ cell(h) }};{{ cell(h_ip) }};{{ cell(h_os | trim) }};{{ cell(h_kernel) }};{{ cell(p[0]) }};{{ cell(p[1]) }};{{ cell(p[2]) }};{{ cell(p[3]) }};{{ cell(p[4]) }};{{ cell(p[5]) }};{{ cell(p[6]) }};{{ cell(p[7]) }};{{ cell(p[8]) }};{{ cell(p[9]) }};{{ cell(p[10]) }};{{ cell(p[11]) }};{{ cell(p[12]) }};{{ cell(p[13]) }};{{ cell(p[14]) }}
+          {% endif %}
+          {% endfor %}
+          {% endif %}
+          {% endfor %}
       delegate_to: "{{ report_host }}"
-      throttle: 1
-      changed_when: false
-      check_mode: false
-
-    - name: Вывести путь к сформированному отчёту в лог запуска
-      ansible.builtin.debug:
-        msg: "Аудит завершён. Отчёт сохранён на {{ report_host }}: {{ report_file }}"
       run_once: true
       check_mode: false
+
+    - name: Собрать сводку по хостам и объектам со статусом CRITICAL
+      ansible.builtin.set_fact:
+        critical_summary: >-
+          {%- set ns = namespace(hosts=[], items=[]) -%}
+          {%- for h in ansible_play_hosts -%}
+            {%- set hv = hostvars[h] -%}
+            {%- if hv.audit_rows is defined and hv.audit_rows.stdout_lines is defined -%}
+              {%- for line in hv.audit_rows.stdout_lines if line | trim | length > 0 -%}
+                {%- set p = line.split('\x1f') -%}
+                {%- if p | length >= 15 and p[14].startswith('CRITICAL') -%}
+                  {%- if h not in ns.hosts -%}
+                    {%- set _ = ns.hosts.append(h) -%}
+                  {%- endif -%}
+                  {%- set _ = ns.items.append(h ~ ' [' ~ p[0] ~ '] — ' ~ p[14]) -%}
+                {%- endif -%}
+              {%- endfor -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ {'hosts': ns.hosts, 'items': ns.items} }}
+      run_once: true
+
+    - name: Вывести итоговую сводку по CRITICAL и путь к отчёту в консоль
+      ansible.builtin.debug:
+        msg: >-
+          {{
+            [
+              'Аудит завершён. Единый отчёт сохранён на ' ~ report_host ~ ': ' ~ report_file,
+              'Проверено хостов: ' ~ (ansible_play_hosts | length),
+              'Хостов со статусом CRITICAL: ' ~ (critical_summary.hosts | length),
+              'Список хостов CRITICAL: ' ~ (critical_summary.hosts | join(', ') if critical_summary.hosts | length > 0 else 'нет'),
+              'Детализация по объектам CRITICAL:' if critical_summary.items | length > 0 else 'Объектов со статусом CRITICAL не обнаружено.'
+            ] + critical_summary.items
+          }}
+      run_once: true
+      
+    - name: Вывести путь к сформированному отчёту в лог запуска
+      ansible.builtin.debug:
+        msg: "Аудит завершён. Единый отчёт сохранён на {{ report_host }}: {{ report_file }}"
+      run_once: true
