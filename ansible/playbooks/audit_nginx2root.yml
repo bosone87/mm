@@ -210,11 +210,11 @@
       delegate_to: "{{ report_host }}"
       run_once: true
       check_mode: false
-
+      
     - name: Собрать сводку по хостам и объектам со статусом CRITICAL
       ansible.builtin.set_fact:
         critical_summary: >-
-          {%- set ns = namespace(hosts=[], items=[]) -%}
+          {%- set ns = namespace(hosts=[], details=[]) -%}
           {%- for h in ansible_play_hosts -%}
             {%- set hv = hostvars[h] -%}
             {%- if hv.audit_rows is defined and hv.audit_rows.stdout_lines is defined -%}
@@ -224,12 +224,12 @@
                   {%- if h not in ns.hosts -%}
                     {%- set _ = ns.hosts.append(h) -%}
                   {%- endif -%}
-                  {%- set _ = ns.items.append(h ~ ' [' ~ p[0] ~ '] — ' ~ p[14]) -%}
+                  {%- set _ = ns.details.append(h ~ ' [' ~ p[0] ~ '] — ' ~ p[14]) -%}
                 {%- endif -%}
               {%- endfor -%}
             {%- endif -%}
           {%- endfor -%}
-          {{ {'hosts': ns.hosts, 'items': ns.items} }}
+          {{ {'hosts': ns.hosts, 'details': ns.details} }}
       run_once: true
 
     - name: Вывести итоговую сводку по CRITICAL и путь к отчёту в консоль
@@ -239,10 +239,10 @@
             [
               'Аудит завершён. Единый отчёт сохранён на ' ~ report_host ~ ': ' ~ report_file,
               'Проверено хостов: ' ~ (ansible_play_hosts | length),
-              'Хостов со статусом CRITICAL: ' ~ (critical_summary.hosts | length),
-              'Список хостов CRITICAL: ' ~ (critical_summary.hosts | join(', ') if critical_summary.hosts | length > 0 else 'нет'),
-              'Детализация по объектам CRITICAL:' if critical_summary.items | length > 0 else 'Объектов со статусом CRITICAL не обнаружено.'
-            ] + critical_summary.items
+              'Хостов со статусом CRITICAL: ' ~ (critical_summary['hosts'] | length),
+              'Список хостов CRITICAL: ' ~ (critical_summary['hosts'] | join(', ') if critical_summary['hosts'] | length > 0 else 'нет'),
+              'Детализация по объектам CRITICAL:' if critical_summary['details'] | length > 0 else 'Объектов со статусом CRITICAL не обнаружено.'
+            ] + critical_summary['details']
           }}
       run_once: true
       
