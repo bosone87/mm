@@ -1,0 +1,291 @@
+---
+- name: Проверка пакетов из веб-формы Semaphore (exact/substring) и выгрузка CSV на adm.lin
+  hosts: "{{ hosts | default('', true) | string | replace(';', ',') | split(',') | map('trim') | reject('equalto', '') | list }}"
+  gather_facts: true
+  gather_subset:
+    - "!all"
+    - "!min"
+    - "distribution"
+    - "pkg_mgr"
+
+  vars:
+    # Приходит из Semaphore Survey (String), например: "apache, docker, openssl"
+    packages_list: >-
+      {{
+        packages | default('', true)
+        | string
+        | replace(';', ',')
+        | split(',')
+        | map('trim')
+        | reject('equalto', '')
+        | unique
+        | list
+      }}
+    # Приходит из Semaphore Survey (Enum): "exact" или "substring"
+    search_mode_norm: "{{ search_mode | default('exact', true) | string | trim | lower }}"
+
+    report_dir: "/tmp/ansible_reports"
+    # Поменяйте на ";" для прямого открытия CSV в русском Excel
+    csv_sep: ","
+
+    # Словарь маппинга для сервисов с разными именами в RPM и DEB.
+    # Любые другие пакеты, введенные в форме, ищутся напрямую по введенному имени.
+    package_map:
+      apache:
+        rpm: ["httpd"]
+        deb: ["apache2"]
+      cron:
+        rpm: ["cronie"]
+        deb: ["cron"]
+      dnsutils:
+        rpm: ["bind-utils"]
+        deb: ["bind9-dnsutils", "dnsutils"]
+      firewall:
+        rpm: ["firewalld"]
+        deb: ["ufw"]
+      ntp:
+        rpm: ["chrony"]
+        rpm_7: ["chrony", "ntp"]
+        deb: ["chrony", "ntp"]
+      netcat:
+        rpm: ["nmap-ncat"]
+        rpm_7: ["nmap-ncat", "nc"]
+        deb: ["netcat-openbsd", "netcat-traditional"]
+      ldap-client:
+        rpm: ["openldap-clients"]
+        deb: ["ldap-utils"]
+      snmp:
+        rpm: ["net-snmp"]
+        deb: ["snmpd"]
+      postgres:
+        rpm: ["postgresql-server"]
+        deb: ["postgresql"]
+
+  tasks:
+    - name: Проверить входные параметры из веб-формы Semaphore
+      ansible.builtin.assert:
+        that:
+          - packages_list | length > 0
+          - search_mode_norm in ['exact', 'substring']
+        fail_msg: >-
+          Некорректные параметры запуска. Проверьте, что переменная packages не пуста,
+          а search_mode равна 'exact' или 'substring' (получено: '{{ search_mode_norm }}').
+      run_once: true
+
+    - name: Разрешить имена пакетов для текущей ОС (RPM / DEB)
+      ansible.builtin.set_fact:
+        pkg_family: "{{ _family }}"
+        host_expected_map: "{{ _expected_map | from_json }}"
+      vars:
+        _family: "{{ 'deb' if ansible_facts.pkg_mgr == 'apt' else 'rpm' }}"
+        _family_ver: "{{ _family }}_{{ ansible_facts.distribution_major_version | default('') }}"
+        _expected_map: >-
+          {% set mapping = {} %}
+          {% for req in packages_list %}
+            {% set key = req if req in package_map else (req | lower if (req | lower) in package_map else '') %}
+            {% if key %}
+              {% set entry = package_map[key] %}
+              {% set raw_c = entry[_family_ver] | default(entry[_family] | default([req])) %}
+              {% set candidates = [raw_c] if raw_c is string else raw_c %}
+            {% else %}
+              {% set candidates = [req] %}
+            {% endif %}
+            {% set _ = mapping.update({req: candidates}) %}
+          {% endfor %}
+          {{ mapping | to_json }}
+
+    - name: Сформировать плоский список шаблонов для поиска на хосте
+      ansible.builtin.set_fact:
+        host_candidate_packages: "{{ host_expected_map.values() | list | flatten | unique | list }}"
+
+    - name: Сбор пакетов через package_facts с fallback для старых и минимальных ОС
+      block:
+        - name: Собрать факты об установленных пакетах
+          ansible.builtin.package_facts:
+            manager: "{{ 'apt' if pkg_family == 'deb' else 'rpm' }}"
+
+        - name: Найти совпадения в package_facts (exact или substring)
+          ansible.builtin.set_fact:
+            raw_found_packages: "{{ _raw_info | from_json }}"
+            facts_source: "package_facts"
+          vars:
+            _raw_info: >-
+              {% set res = {} %}
+              {% if search_mode_norm == 'exact' %}
+                {% for pkg in host_candidate_packages %}
+                  {% if pkg in ansible_facts.packages %}
+                    {% set vers = [] %}
+                    {% for p in ansible_facts.packages[pkg] %}
+                      {% set ver = p.version ~ ('-' ~ p.release if (p.release is defined and p.release) else '') %}
+                      {% if ver not in vers %}
+                        {% set _ = vers.append(ver) %}
+                      {% endif %}
+                    {% endfor %}
+                    {% set _ = res.update({pkg: vers}) %}
+                  {% endif %}
+                {% endfor %}
+              {% else %}
+                {% for inst_pkg, pkg_entries in ansible_facts.packages.items() %}
+                  {% set hit = [] %}
+                  {% for cand in host_candidate_packages %}
+                    {% if (cand | lower) in (inst_pkg | lower) %}
+                      {% set _ = hit.append(1) %}
+                    {% endif %}
+                  {% endfor %}
+                  {% if hit | length > 0 %}
+                    {% set vers = [] %}
+                    {% for p in pkg_entries %}
+                      {% set ver = p.version ~ ('-' ~ p.release if (p.release is defined and p.release) else '') %}
+                      {% if ver not in vers %}
+                        {% set _ = vers.append(ver) %}
+                      {% endif %}
+                    {% endfor %}
+                    {% set _ = res.update({inst_pkg: vers}) %}
+                  {% endif %}
+                {% endfor %}
+              {% endif %}
+              {{ res | to_json }}
+
+      rescue:
+        - name: Fallback для RPM (РЕД ОС 7.3/8.0, RHEL 7/8, CentOS 7, Oracle Linux 8/9)
+          ansible.builtin.command:
+            argv:
+              - rpm
+              - -qa
+              - --qf
+              - "%{NAME}|%{VERSION}-%{RELEASE}\n"
+          register: rpm_fallback
+          changed_when: false
+          when: pkg_family == 'rpm'
+
+        - name: Fallback для DEB (Ubuntu 20.04/22.04)
+          ansible.builtin.command:
+            argv:
+              - dpkg-query
+              - -W
+              - "-f=${Status}|${Package}|${Version}\n"
+          register: deb_fallback
+          changed_when: false
+          when: pkg_family == 'deb'
+
+        - name: Найти совпадения через CLI fallback (exact или substring)
+          ansible.builtin.set_fact:
+            raw_found_packages: "{{ _raw_info | from_json }}"
+            facts_source: "cli_fallback"
+          vars:
+            _lines: >-
+              {{
+                (deb_fallback.stdout_lines | default([]))
+                if pkg_family == 'deb'
+                else (rpm_fallback.stdout_lines | default([]))
+              }}
+            _raw_info: >-
+              {% set res = {} %}
+              {% for line in _lines %}
+                {% set parts = line.split('|') %}
+                {% set valid = (parts | length == 3 and parts[0] == 'install ok installed') if pkg_family == 'deb' else (parts | length == 2) %}
+                {% if valid %}
+                  {% set pkg_name = parts[1] if pkg_family == 'deb' else parts[0] %}
+                  {% set pkg_ver = parts[2] if pkg_family == 'deb' else parts[1] %}
+                  {% set hit = [] %}
+                  {% for cand in host_candidate_packages %}
+                    {% if (search_mode_norm == 'exact' and pkg_name == cand) or (search_mode_norm == 'substring' and (cand | lower) in (pkg_name | lower)) %}
+                      {% set _ = hit.append(1) %}
+                    {% endif %}
+                  {% endfor %}
+                  {% if hit | length > 0 %}
+                    {% set cur = res.get(pkg_name, []) %}
+                    {% if pkg_ver not in cur %}
+                      {% set _ = res.update({pkg_name: cur + [pkg_ver]}) %}
+                    {% endif %}
+                  {% endif %}
+                {% endif %}
+              {% endfor %}
+              {{ res | to_json }}
+
+    - name: Сопоставить все найденные пакеты с исходным запросом
+      ansible.builtin.set_fact:
+        host_report_items: "{{ _report_items | from_json }}"
+      vars:
+        _report_items: >-
+          {% set items = {} %}
+          {% for req in packages_list %}
+            {% set expected = host_expected_map[req] %}
+            {% set matched = [] %}
+            {% for inst_pkg in (raw_found_packages.keys() | sort) %}
+              {% set hit = [] %}
+              {% for cand in expected %}
+                {% if (search_mode_norm == 'exact' and inst_pkg == cand) or (search_mode_norm == 'substring' and (cand | lower) in (inst_pkg | lower)) %}
+                  {% set _ = hit.append(1) %}
+                {% endif %}
+              {% endfor %}
+              {% if hit | length > 0 %}
+                {% set _ = matched.append({
+                  'package': inst_pkg,
+                  'version': raw_found_packages[inst_pkg] | join('; ')
+                }) %}
+              {% endif %}
+            {% endfor %}
+            {% set _ = items.update({
+              req: {
+                'status': 'installed' if (matched | length > 0) else 'missing',
+                'expected_packages': expected,
+                'matched': matched
+              }
+            }) %}
+          {% endfor %}
+          {{ items | to_json }}
+
+    - name: Вывод результатов проверки на экран по каждому хосту
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          os: "{{ ansible_facts.distribution | default('Unknown') }} {{ ansible_facts.distribution_version | default('') }}"
+          pkg_family: "{{ pkg_family }}"
+          search_mode: "{{ search_mode_norm }}"
+          source: "{{ facts_source }}"
+          results: "{{ host_report_items }}"
+
+    - name: Создать каталог для отчетов на adm.lin
+      ansible.builtin.file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: "0755"
+      delegate_to: adm.lin
+      run_once: true
+
+    - name: Сохранить единый CSV-отчет по всем хостам на adm.lin
+      ansible.builtin.copy:
+        dest: "{{ report_dir }}/packages_{{ search_mode_norm }}_{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}.csv"
+        mode: "0644"
+        content: |
+          host{{ csv_sep }}os{{ csv_sep }}pkg_family{{ csv_sep }}pkg_mgr{{ csv_sep }}search_mode{{ csv_sep }}requested{{ csv_sep }}package{{ csv_sep }}status{{ csv_sep }}version{{ csv_sep }}source
+          {% for h in ansible_play_hosts_all -%}
+          {% set hv = hostvars[h] -%}
+          {% if hv.host_report_items is defined -%}
+          {% set os_name = ((hv.ansible_facts.distribution | default('Unknown')) ~ ' ' ~ (hv.ansible_facts.distribution_version | default(''))) | trim -%}
+          {% set pf = hv.pkg_family | default('unknown') -%}
+          {% set pm = hv.ansible_facts.pkg_mgr | default('unknown') -%}
+          {% set src = hv.facts_source | default('package_facts') -%}
+          {% for req in packages_list -%}
+          {% set item = hv.host_report_items[req] -%}
+          {% if item.status == 'installed' -%}
+          {% for m in item.matched -%}
+          "{{ h }}"{{ csv_sep }}"{{ os_name }}"{{ csv_sep }}"{{ pf }}"{{ csv_sep }}"{{ pm }}"{{ csv_sep }}"{{ search_mode_norm }}"{{ csv_sep }}"{{ req }}"{{ csv_sep }}"{{ m.package }}"{{ csv_sep }}"installed"{{ csv_sep }}"{{ m.version }}"{{ csv_sep }}"{{ src }}"
+          {% endfor -%}
+          {% else -%}
+          "{{ h }}"{{ csv_sep }}"{{ os_name }}"{{ csv_sep }}"{{ pf }}"{{ csv_sep }}"{{ pm }}"{{ csv_sep }}"{{ search_mode_norm }}"{{ csv_sep }}"{{ req }}"{{ csv_sep }}"{{ item.expected_packages | join(' / ') }}"{{ csv_sep }}"missing"{{ csv_sep }}""{{ csv_sep }}"{{ src }}"
+          {% endif -%}
+          {% endfor -%}
+          {% else -%}
+          "{{ h }}"{{ csv_sep }}"unknown"{{ csv_sep }}"unknown"{{ csv_sep }}"unknown"{{ csv_sep }}"{{ search_mode_norm }}"{{ csv_sep }}"ALL"{{ csv_sep }}""{{ csv_sep }}"unreachable_or_failed"{{ csv_sep }}""{{ csv_sep }}"none"
+          {% endif -%}
+          {% endfor -%}
+      delegate_to: adm.lin
+      run_once: true
+      register: csv_report
+
+    - name: Показать путь к сохраненному отчету на adm.lin
+      ansible.builtin.debug:
+        msg: "Единый CSV-отчет сохранен на adm.lin: {{ csv_report.dest }}"
+      run_once: true
