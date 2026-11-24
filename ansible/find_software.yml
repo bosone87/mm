@@ -1,0 +1,19 @@
+---
+- name: Мультипрофильный аудит ПО на хостах и в контейнерах
+  hosts: "{{ hosts | default('', true) | string | replace(';', ',') | split(',') | map('trim') | reject('equalto', '') | list }}"
+  strategy: free
+  gather_facts: true
+  gather_subset: ["!all", "!min", "distribution", "pkg_mgr"]
+  tasks:
+    - name: Запустить аудит выбранных профилей
+      ansible.builtin.import_role:
+        name: software_audit
+
+- name: Сохранить единый CSV-отчет на adm.lin
+  hosts: adm.lin
+  gather_facts: false
+  tasks:
+    - name: Сформировать CSV-отчет
+      ansible.builtin.import_role:
+        name: software_audit
+        tasks_from: report.yml

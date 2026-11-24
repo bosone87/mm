@@ -1,0 +1,42 @@
+---
+- name: Подготовить список профилей для формирования отчета
+  ansible.builtin.import_tasks: parse_targets.yml
+
+- name: Сформировать список проверенных хостов и имя файла отчета
+  ansible.builtin.set_fact:
+    software_audit_hosts_list: >-
+      {{
+        query(
+          'ansible.builtin.inventory_hostnames',
+          hosts | default('', true) | string | replace(';', ',') | split(',') | map('trim') | reject('equalto', '') | join(',')
+        )
+      }}
+    software_audit_report_slug: >-
+      {{
+        'all'
+        if (software_audit_targets_list | sort) == (software_audit_profiles.keys() | sort | list)
+        else (
+          software_audit_targets_list | join('-')
+          if (software_audit_targets_list | length <= 3)
+          else ('multi_' ~ (software_audit_targets_list | length) ~ '_profiles')
+        )
+      }}
+
+- name: Создать каталог для отчетов на adm.lin
+  ansible.builtin.file:
+    path: "{{ software_audit_report_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Сохранить единый CSV-отчет на adm.lin
+  ansible.builtin.copy:
+    dest: "{{ software_audit_report_dir }}/{{ software_audit_report_slug }}_audit_{{ lookup('ansible.builtin.pipe', 'date +%Y%m%d_%H%M%S') }}.csv"
+    mode: "0644"
+    content: "{{ lookup('ansible.builtin.template', 'report.csv.j2') }}"
+  register: software_audit_csv_report
+
+- name: Показать путь к сохраненному отчету на adm.lin
+  ansible.builtin.debug:
+    msg: >-
+      CSV-отчет по профилям ({{ software_audit_targets_list | join(', ') }})
+      сохранен на adm.lin: {{ software_audit_csv_report.dest }}

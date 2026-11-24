@@ -1,0 +1,310 @@
+---
+- name: Подготовить список профилей аудита
+  ansible.builtin.import_tasks: parse_targets.yml
+
+- name: Определить семейство пакетного менеджера и ожидаемые пакеты по профилям
+  ansible.builtin.set_fact:
+    pkg_family: "{{ 'deb' if ansible_facts.pkg_mgr == 'apt' else 'rpm' }}"
+    host_expected_packages_by_target: "{{ _by_target | from_json }}"
+  vars:
+    _pkg_key: "{{ 'deb_packages' if ansible_facts.pkg_mgr == 'apt' else 'rpm_packages' }}"
+    _by_target: >-
+      {% set res = {} %}
+      {% for t in software_audit_targets_list %}
+        {% set _ = res.update({t: software_audit_profiles[t][_pkg_key]}) %}
+      {% endfor %}
+      {{ res | to_json }}
+
+- name: Сформировать объединенный список пакетов для однократного поиска на хосте
+  ansible.builtin.set_fact:
+    host_all_expected_packages: "{{ host_expected_packages_by_target.values() | list | flatten | unique | list }}"
+
+- name: Сбор пакетов на хосте через package_facts с fallback для legacy/minimal ОС
+  block:
+    - name: Собрать package_facts
+      ansible.builtin.package_facts:
+        manager: "{{ 'apt' if pkg_family == 'deb' else 'rpm' }}"
+
+    - name: Отобрать целевые пакеты из package_facts
+      ansible.builtin.set_fact:
+        host_raw_found_packages: "{{ _raw_info | from_json }}"
+        facts_source: "package_facts"
+      vars:
+        _raw_info: >-
+          {% set res = {} %}
+          {% for pkg in host_all_expected_packages %}
+            {% if pkg in ansible_facts.packages %}
+              {% set vers = [] %}
+              {% for p in ansible_facts.packages[pkg] %}
+                {% set ver = p.version ~ ('-' ~ p.release if (p.release is defined and p.release) else '') %}
+                {% if ver not in vers %}
+                  {% set _ = vers.append(ver) %}
+                {% endif %}
+              {% endfor %}
+              {% set _ = res.update({pkg: vers}) %}
+            {% endif %}
+          {% endfor %}
+          {{ res | to_json }}
+
+  rescue:
+    - name: Fallback для RPM (РЕД ОС 7.3/8.0, RHEL 7/8, CentOS 7, Oracle Linux 8/9)
+      ansible.builtin.command:
+        argv:
+          - rpm
+          - -qa
+          - --qf
+          - "%{NAME}|%{VERSION}-%{RELEASE}\n"
+      register: rpm_fallback
+      changed_when: false
+      check_mode: false
+      when: pkg_family == 'rpm'
+
+    - name: Fallback для DEB (Ubuntu 20.04/22.04)
+      ansible.builtin.command:
+        argv:
+          - dpkg-query
+          - -W
+          - "-f=${Status}|${Package}|${Version}\n"
+      register: deb_fallback
+      changed_when: false
+      check_mode: false
+      when: pkg_family == 'deb'
+
+    - name: Отобрать целевые пакеты из CLI fallback
+      ansible.builtin.set_fact:
+        host_raw_found_packages: "{{ _raw_info | from_json }}"
+        facts_source: "cli_fallback"
+      vars:
+        _lines: >-
+          {{
+            (deb_fallback.stdout_lines | default([]))
+            if pkg_family == 'deb'
+            else (rpm_fallback.stdout_lines | default([]))
+          }}
+        _raw_info: >-
+          {% set res = {} %}
+          {% for line in _lines %}
+            {% set parts = line.split('|') %}
+            {% set valid = (parts | length == 3 and parts[0] == 'install ok installed') if pkg_family == 'deb' else (parts | length == 2) %}
+            {% if valid %}
+              {% set pkg_name = parts[1] if pkg_family == 'deb' else parts[0] %}
+              {% set pkg_ver = parts[2] if pkg_family == 'deb' else parts[1] %}
+              {% if pkg_name in host_all_expected_packages %}
+                {% set cur = res.get(pkg_name, []) %}
+                {% if pkg_ver not in cur %}
+                  {% set _ = res.update({pkg_name: cur + [pkg_ver]}) %}
+                {% endif %}
+              {% endif %}
+            {% endif %}
+          {% endfor %}
+          {{ res | to_json }}
+
+- name: Разложить найденные пакеты по профилям и определить профили без пакетов
+  ansible.builtin.set_fact:
+    host_found_packages_by_target: "{{ _by_target | from_json }}"
+    targets_without_packages: "{{ _missing_targets | from_json }}"
+  vars:
+    _by_target: >-
+      {% set res = {} %}
+      {% for t in software_audit_targets_list %}
+        {% set t_pkgs = {} %}
+        {% for pkg in host_expected_packages_by_target[t] %}
+          {% if pkg in host_raw_found_packages %}
+            {% set _ = t_pkgs.update({pkg: host_raw_found_packages[pkg]}) %}
+          {% endif %}
+        {% endfor %}
+        {% set _ = res.update({t: t_pkgs}) %}
+      {% endfor %}
+      {{ res | to_json }}
+    _missing_targets: >-
+      {% set res = [] %}
+      {% for t in software_audit_targets_list %}
+        {% set found = [] %}
+        {% for pkg in host_expected_packages_by_target[t] %}
+          {% if pkg in host_raw_found_packages %}
+            {% set _ = found.append(pkg) %}
+          {% endif %}
+        {% endfor %}
+        {% if found | length == 0 %}
+          {% set _ = res.append(t) %}
+        {% endif %}
+      {% endfor %}
+      {{ res | to_json }}
+
+- name: Проверить бинарники на хосте для профилей без установленных пакетов (одним запуском)
+  ansible.builtin.shell:
+    executable: /bin/sh
+    cmd: |
+      {% for t in targets_without_packages %}
+      {% set prof = software_audit_profiles[t] %}
+      for bin_name in {{ prof.host_binaries | map('quote') | join(' ') }}; do
+        bin_path=$(command -v "$bin_name" 2>/dev/null || true)
+        if [ -n "$bin_path" ]; then
+          bin_ver=$(sh -c {{ prof.version_cmd | quote }} 2>/dev/null | tr '\r\n"|' '   ' | sed 's/^ *//; s/ *$//' | cut -c1-120 || true)
+          printf '%s|%s|%s\n' {{ t | quote }} "$bin_path" "${bin_ver:-unknown}"
+          break
+        fi
+      done
+      {% endfor %}
+  register: host_bin_check
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: targets_without_packages | length > 0
+
+- name: Разобрать найденные бинарники без пакетов по профилям
+  ansible.builtin.set_fact:
+    host_unmanaged_binaries_by_target: "{{ _bins | from_json }}"
+  vars:
+    _bins: >-
+      {% set res = {} %}
+      {% for line in (host_bin_check.stdout_lines | default([])) %}
+        {% set p = line.split('|', 2) %}
+        {% if p | length == 3 %}
+          {% set _ = res.update({p[0]: {'path': p[1], 'version': p[2]}}) %}
+        {% endif %}
+      {% endfor %}
+      {{ res | to_json }}
+
+- name: Собрать общий список контейнеров на хосте (Docker, Podman, nerdctl)
+  ansible.builtin.shell:
+    executable: /bin/sh
+    cmd: |
+      {% raw %}
+      dump_runtime() {
+        rt="$1"
+        use_sudo="$2"
+        prefix="$3"
+        if ! $prefix "$rt" ps -a --format '{{.ID}}' >/dev/null 2>&1; then
+          return 0
+        fi
+        $prefix "$rt" ps -a --no-trunc --format '{{.ID}}|{{.Names}}|{{.Image}}|{{.Status}}|{{.Command}}' 2>/dev/null | \
+        while IFS='|' read -r cid cname cimage cstatus ccmd; do
+          [ -n "$cid" ] || continue
+          safe_name=$(printf '%s' "$cname" | tr '\r\n"|' '    ')
+          safe_image=$(printf '%s' "$cimage" | tr '\r\n"|' '    ')
+          safe_status=$(printf '%s' "$cstatus" | tr '\r\n"|' '    ')
+          safe_cmd=$(printf '%s' "$ccmd" | tr '\r\n' '  ')
+          printf '%s|%s|%s|%s|%s|%s|%s\n' "$rt" "$use_sudo" "$cid" "$safe_name" "$safe_image" "$safe_status" "$safe_cmd"
+        done
+      }
+
+      for rt in docker podman nerdctl; do
+        command -v "$rt" >/dev/null 2>&1 || continue
+        if [ "$(id -u)" -eq 0 ]; then
+          dump_runtime "$rt" "0" ""
+        elif sudo -n "$rt" ps -a --format '{{.ID}}' >/dev/null 2>&1; then
+          dump_runtime "$rt" "1" "sudo -n"
+          if [ "$rt" = "podman" ]; then
+            dump_runtime "$rt" "0" ""
+          fi
+        else
+          dump_runtime "$rt" "0" ""
+        fi
+      done | sort -u
+      {% endraw %}
+  register: raw_container_scan
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Сопоставить контейнеры со всеми выбранными профилями
+  ansible.builtin.set_fact:
+    matched_containers: "{{ _matched | from_json }}"
+  vars:
+    _matched: >-
+      {% set res = [] %}
+      {% for line in (raw_container_scan.stdout_lines | default([])) %}
+        {% set p = line.split('|', 6) %}
+        {% if p | length >= 7 %}
+          {% set haystack = p[3] ~ ' ' ~ p[4] ~ ' ' ~ p[6] %}
+          {% set is_run = (p[5] | lower is search('^(up|running)')) %}
+          {% for t in software_audit_targets_list %}
+            {% if haystack is search(software_audit_profiles[t].container_regex, ignorecase=True) %}
+              {% set _ = res.append({
+                'target': t,
+                'runtime': p[0],
+                'use_sudo': (p[1] == '1'),
+                'cid': p[2],
+                'id': p[2][:12],
+                'name': p[3],
+                'image': p[4],
+                'status': p[5],
+                'is_running': is_run
+              }) %}
+            {% endif %}
+          {% endfor %}
+        {% endif %}
+      {% endfor %}
+      {{ res | to_json }}
+
+- name: Отобрать запущенные совпавшие контейнеры для проверки версий
+  ansible.builtin.set_fact:
+    running_matched_containers: "{{ matched_containers | selectattr('is_running') | list }}"
+
+- name: Получить версии внутри найденных запущенных контейнеров (одним запуском)
+  ansible.builtin.shell:
+    executable: /bin/sh
+    cmd: |
+      {% for c in running_matched_containers %}
+      {% set prof = software_audit_profiles[c.target] %}
+      cver=$(timeout 3 {{ 'sudo -n ' if c.use_sudo else '' }}{{ c.runtime | quote }} exec {{ c.cid | quote }} sh -c {{ prof.version_cmd | quote }} 2>/dev/null | tr '\r\n"|' '   ' | sed 's/^ *//; s/ *$//' | cut -c1-120 || true)
+      printf '%s|%s|%s|%s\n' {{ c.target | quote }} {{ c.runtime | quote }} {{ c.cid | quote }} "$cver"
+      {% endfor %}
+  register: container_versions_scan
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: running_matched_containers | length > 0
+
+- name: Собрать итоговые результаты аудита хоста по всем выбранным профилям
+  ansible.builtin.set_fact:
+    host_audit_results: "{{ _audit_results | from_json }}"
+  vars:
+    _audit_results: >-
+      {% set ver_map = {} %}
+      {% for line in (container_versions_scan.stdout_lines | default([])) %}
+        {% set p = line.split('|', 3) %}
+        {% if p | length == 4 and p[3] %}
+          {% set _ = ver_map.update({(p[0] ~ '|' ~ p[1] ~ '|' ~ p[2]): p[3]}) %}
+        {% endif %}
+      {% endfor %}
+      {% set res = {} %}
+      {% for t in software_audit_targets_list %}
+        {% set t_containers = [] %}
+        {% for c in matched_containers %}
+          {% if c.target == t %}
+            {% set ckey = c.target ~ '|' ~ c.runtime ~ '|' ~ c.cid %}
+            {% set cver = ver_map.get(ckey, '') %}
+            {% if not cver %}
+              {% set img_last = c.image.split('/')[-1] %}
+              {% set cver = ('image:' ~ img_last.split(':')[-1]) if (':' in img_last) else 'image:untagged' %}
+            {% endif %}
+            {% set _ = t_containers.append({
+              'runtime': c.runtime,
+              'id': c.id,
+              'name': c.name,
+              'image': c.image,
+              'status': c.status,
+              'version': cver
+            }) %}
+          {% endif %}
+        {% endfor %}
+        {% set _ = res.update({
+          t: {
+            'expected_packages': host_expected_packages_by_target[t],
+            'packages': host_found_packages_by_target[t],
+            'unmanaged_binary': host_unmanaged_binaries_by_target.get(t, {}),
+            'containers': t_containers
+          }
+        }) %}
+      {% endfor %}
+      {{ res | to_json }}
+
+- name: Вывод результатов проверки на экран по хосту
+  ansible.builtin.debug:
+    msg:
+      host: "{{ inventory_hostname }}"
+      os: "{{ ansible_facts.distribution | default('Unknown') }} {{ ansible_facts.distribution_version | default('') }}"
+      targets: "{{ software_audit_targets_list }}"
+      results: "{{ host_audit_results }}"

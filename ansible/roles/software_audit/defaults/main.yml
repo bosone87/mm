@@ -1,0 +1,67 @@
+---
+software_audit_target: ""
+software_audit_targets: ""
+software_audit_report_dir: "/tmp/ansible_reports"
+software_audit_csv_sep: ";"
+# UTF-8 BOM для корректного отображения кириллицы в Excel
+software_audit_csv_bom: true
+
+software_audit_profiles:
+  grafana:
+    rpm_packages:
+      - grafana
+      - grafana-enterprise
+      - grafana-oss
+    deb_packages:
+      - grafana
+      - grafana-enterprise
+      - grafana-oss
+    host_binaries:
+      - grafana-server
+      - grafana
+    container_regex: "grafana"
+    version_cmd: "grafana server -v 2>/dev/null || grafana-server -v 2>/dev/null"
+
+  httpd:
+    rpm_packages:
+      - httpd
+      - httpd24-httpd
+    deb_packages:
+      - apache2
+    host_binaries:
+      - httpd
+      - apache2
+    container_regex: "(^|[/:_-])(httpd|apache2)([/:_.-]|$)|php[^ ]*-apache"
+    version_cmd: "httpd -v 2>/dev/null | head -n1 || apache2 -v 2>/dev/null | head -n1"
+
+  nginx:
+    rpm_packages:
+      - nginx
+      - nginx-core
+      - nginx-plus
+    deb_packages:
+      - nginx
+      - nginx-core
+      - nginx-full
+      - nginx-light
+      - nginx-extras
+      - nginx-plus
+    host_binaries:
+      - nginx
+    container_regex: "(^|[/:_-])nginx([/:_.-]|$)"
+    version_cmd: "nginx -v 2>&1 | head -n1"
+
+  redis:
+    rpm_packages:
+      - redis
+      - redis6
+      - redis-stack-server
+      - redis-server
+    deb_packages:
+      - redis-server
+      - redis
+      - redis-stack-server
+    host_binaries:
+      - redis-server
+    container_regex: "(^|[/:_-])redis([/:_.-]|$)"
+    version_cmd: "redis-server -v 2>/dev/null | head -n1"

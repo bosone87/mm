@@ -1,0 +1,29 @@
+{%- macro q(val) -%}"{{ val | default('', true) | string | replace('"', '""') }}"{%- endmacro -%}
+{%- set sep = software_audit_csv_sep -%}
+{%- if software_audit_csv_bom | bool %}{{ '\ufeff' }}{% endif -%}
+host{{ sep }}os{{ sep }}pkg_mgr{{ sep }}target{{ sep }}scope{{ sep }}source_or_runtime{{ sep }}name{{ sep }}status{{ sep }}version{{ sep }}details
+{% for h in software_audit_hosts_list -%}
+{% set hv = hostvars[h] | default({}) -%}
+{% if hv.host_audit_results is defined -%}
+{% set os_name = ((hv.ansible_facts.distribution | default('Unknown')) ~ ' ' ~ (hv.ansible_facts.distribution_version | default(''))) | trim -%}
+{% set pm = hv.ansible_facts.pkg_mgr | default('unknown') -%}
+{% set src = hv.facts_source | default('package_facts') -%}
+{% for t in software_audit_targets_list -%}
+{% set res = hv.host_audit_results[t] -%}
+{% if res.packages | length > 0 -%}
+{% for pkg_name, pkg_vers in res.packages.items() -%}
+{{ q(h) }}{{ sep }}{{ q(os_name) }}{{ sep }}{{ q(pm) }}{{ sep }}{{ q(t) }}{{ sep }}{{ q('host') }}{{ sep }}{{ q(src) }}{{ sep }}{{ q(pkg_name) }}{{ sep }}{{ q('installed') }}{{ sep }}{{ q(pkg_vers | join('; ')) }}{{ sep }}{{ q('') }}
+{% endfor -%}
+{% elif res.unmanaged_binary | length > 0 -%}
+{{ q(h) }}{{ sep }}{{ q(os_name) }}{{ sep }}{{ q(pm) }}{{ sep }}{{ q(t) }}{{ sep }}{{ q('host') }}{{ sep }}{{ q('binary_unmanaged') }}{{ sep }}{{ q(res.unmanaged_binary.path) }}{{ sep }}{{ q('installed_unmanaged') }}{{ sep }}{{ q(res.unmanaged_binary.version) }}{{ sep }}{{ q('') }}
+{% else -%}
+{{ q(h) }}{{ sep }}{{ q(os_name) }}{{ sep }}{{ q(pm) }}{{ sep }}{{ q(t) }}{{ sep }}{{ q('host') }}{{ sep }}{{ q(src) }}{{ sep }}{{ q(res.expected_packages | join(' / ')) }}{{ sep }}{{ q('missing') }}{{ sep }}{{ q('') }}{{ sep }}{{ q('') }}
+{% endif -%}
+{% for c in res.containers -%}
+{{ q(h) }}{{ sep }}{{ q(os_name) }}{{ sep }}{{ q(pm) }}{{ sep }}{{ q(t) }}{{ sep }}{{ q('container') }}{{ sep }}{{ q(c.runtime) }}{{ sep }}{{ q(c.name) }}{{ sep }}{{ q(c.status) }}{{ sep }}{{ q(c.version) }}{{ sep }}{{ q('id=' ~ c.id ~ '; image=' ~ c.image) }}
+{% endfor -%}
+{% endfor -%}
+{% else -%}
+{{ q(h) }}{{ sep }}{{ q('unknown') }}{{ sep }}{{ q('unknown') }}{{ sep }}{{ q(software_audit_targets_list | join(';')) }}{{ sep }}{{ q('host') }}{{ sep }}{{ q('none') }}{{ sep }}{{ q('') }}{{ sep }}{{ q('unreachable_or_failed') }}{{ sep }}{{ q('') }}{{ sep }}{{ q('') }}
+{% endif -%}
+{% endfor -%}

@@ -1,0 +1,316 @@
+---
+- name: Аудит запущенных и остановленных контейнеров (Docker, Podman, Kubernetes)
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: false
+  become: true
+  ignore_unreachable: true
+  any_errors_fatal: false
+
+  vars:
+    # Проверять rootless-контейнеры Podman у обычных пользователей
+    check_rootless_podman: true
+    # Хост и каталог для сохранения итогового CSV-отчёта
+    report_dest_host: "localhost"
+    report_dir: "/tmp"
+
+  tasks:
+    - name: Сбор статистики контейнеров на целевом хосте
+      ansible.builtin.shell: |
+        {% raw %}
+        set -u
+        export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/var/lib/rancher/rke2/bin:/opt/bin:${PATH:-}"
+
+        OS_NAME="unknown"
+        if [ -r /etc/os-release ]; then
+          OS_NAME=$(awk -F= '/^PRETTY_NAME=/{gsub(/^"|"$/, "", $2); print $2; exit}' /etc/os-release)
+        elif [ -r /etc/redhat-release ]; then
+          OS_NAME=$(head -n1 /etc/redhat-release)
+        fi
+        OS_NAME=$(printf '%s' "$OS_NAME" | tr -d '\r\n;' | sed 's/\\/\\\\/g; s/"/\\"/g')
+
+        DOCKER_STATUS="not_installed"
+        DOCKER_RUN=0
+        DOCKER_STOP=0
+        DOCKER_K8S_RUN=0
+        DOCKER_K8S_STOP=0
+
+        PODMAN_STATUS="not_installed"
+        PODMAN_RUN=0
+        PODMAN_STOP=0
+        PODMAN_ROOTLESS_RUN=0
+        PODMAN_ROOTLESS_STOP=0
+
+        K8S_STATUS="not_detected"
+        K8S_RUNTIME="none"
+        K8S_RUN=0
+        K8S_STOP=0
+
+        # --------------------------------------------------
+        # 1. DOCKER (с защитой от podman-docker и K8s-меток)
+        # --------------------------------------------------
+        if command -v docker >/dev/null 2>&1; then
+          if timeout 5 docker --version 2>&1 | grep -qi "podman"; then
+            DOCKER_STATUS="podman_alias"
+          else
+            DOCKER_OUT=$(timeout 15 docker ps -a --format '{{.Status}}|{{.Label "io.kubernetes.pod.name"}}|{{.Label "io.kubernetes.docker.type"}}' 2>/dev/null)
+            RC=$?
+            if [ "$RC" -eq 0 ]; then
+              DOCKER_STATUS="ok"
+              if [ -n "$DOCKER_OUT" ]; then
+                read -r DOCKER_RUN DOCKER_STOP DOCKER_K8S_RUN DOCKER_K8S_STOP <<EOF
+        $(printf '%s\n' "$DOCKER_OUT" | awk -F'|' '
+          BEGIN { dr=0; ds=0; kr=0; ks=0 }
+          NF >= 1 {
+            st = $1; kpod = $2; ktype = $3;
+            is_run = (st ~ /^Up / && st !~ /\(Paused\)/) ? 1 : 0;
+            if (kpod != "") {
+              if (ktype == "podsandbox") next;
+              if (is_run) kr++; else ks++;
+            } else {
+              if (is_run) dr++; else ds++;
+            }
+          }
+          END { printf "%d %d %d %d\n", dr, ds, kr, ks }
+        ')
+        EOF
+              fi
+            elif [ "$RC" -eq 124 ]; then
+              DOCKER_STATUS="timeout"
+            else
+              DOCKER_STATUS="daemon_stopped"
+            fi
+          fi
+        fi
+
+        # --------------------------------------------------
+        # 2. PODMAN (rootful + опционально rootless)
+        # --------------------------------------------------
+        if command -v podman >/dev/null 2>&1; then
+          P_ALL_OUT=$(timeout 15 podman ps -aq 2>/dev/null)
+          RC=$?
+          if [ "$RC" -eq 0 ]; then
+            PODMAN_STATUS="ok"
+            P_RUN_OUT=$(timeout 15 podman ps -q --filter status=running 2>/dev/null)
+            P_ALL=$(printf '%s\n' "$P_ALL_OUT" | awk 'NF==1 && $1 ~ /^[0-9a-f]{12,64}$/{c++} END{print c+0}')
+            P_RUN=$(printf '%s\n' "$P_RUN_OUT" | awk 'NF==1 && $1 ~ /^[0-9a-f]{12,64}$/{c++} END{print c+0}')
+            PODMAN_RUN=$P_RUN
+            PODMAN_STOP=$(( P_ALL > P_RUN ? P_ALL - P_RUN : 0 ))
+          elif [ "$RC" -eq 124 ]; then
+            PODMAN_STATUS="timeout"
+          else
+            PODMAN_STATUS="error"
+          fi
+
+          if [ "${CHECK_ROOTLESS_PODMAN:-1}" = "1" ]; then
+            while IFS=: read -r u_name _ u_uid _ _ u_home _; do
+              [ -z "$u_uid" ] && continue
+              case "$u_uid" in *[!0-9]*) continue ;; esac
+              if [ "$u_uid" -ge 1000 ] && [ "$u_uid" -lt 65000 ] && [ -d "${u_home}/.local/share/containers/storage" ]; then
+                u_xdg="/run/user/${u_uid}"
+                if command -v runuser >/dev/null 2>&1; then
+                  if [ -d "$u_xdg" ]; then
+                    U_ALL_OUT=$(timeout 10 runuser -u "$u_name" -- env HOME="$u_home" XDG_RUNTIME_DIR="$u_xdg" podman ps -aq 2>/dev/null || true)
+                    U_RUN_OUT=$(timeout 10 runuser -u "$u_name" -- env HOME="$u_home" XDG_RUNTIME_DIR="$u_xdg" podman ps -q --filter status=running 2>/dev/null || true)
+                  else
+                    U_ALL_OUT=$(timeout 10 runuser -u "$u_name" -- env HOME="$u_home" podman ps -aq 2>/dev/null || true)
+                    U_RUN_OUT=$(timeout 10 runuser -u "$u_name" -- env HOME="$u_home" podman ps -q --filter status=running 2>/dev/null || true)
+                  fi
+                else
+                  U_ALL_OUT=$(timeout 10 su -s /bin/sh "$u_name" -c "HOME='${u_home}' XDG_RUNTIME_DIR='${u_xdg}' podman ps -aq" 2>/dev/null || true)
+                  U_RUN_OUT=$(timeout 10 su -s /bin/sh "$u_name" -c "HOME='${u_home}' XDG_RUNTIME_DIR='${u_xdg}' podman ps -q --filter status=running" 2>/dev/null || true)
+                fi
+                U_ALL=$(printf '%s\n' "$U_ALL_OUT" | awk 'NF==1 && $1 ~ /^[0-9a-f]{12,64}$/{c++} END{print c+0}')
+                U_RUN=$(printf '%s\n' "$U_RUN_OUT" | awk 'NF==1 && $1 ~ /^[0-9a-f]{12,64}$/{c++} END{print c+0}')
+                U_STOP=$(( U_ALL > U_RUN ? U_ALL - U_RUN : 0 ))
+                PODMAN_ROOTLESS_RUN=$(( PODMAN_ROOTLESS_RUN + U_RUN ))
+                PODMAN_ROOTLESS_STOP=$(( PODMAN_ROOTLESS_STOP + U_STOP ))
+              fi
+            done < /etc/passwd
+          fi
+        fi
+
+        # --------------------------------------------------
+        # 3. KUBERNETES (уровень узла: crictl / ctr / docker)
+        # --------------------------------------------------
+        IS_K8S_NODE=0
+        if command -v kubelet >/dev/null 2>&1 || [ -d /etc/kubernetes ] || [ -S /run/k3s/containerd/containerd.sock ] || [ -S /run/crio/crio.sock ]; then
+          IS_K8S_NODE=1
+        fi
+
+        CRICTL_OK=0
+        if command -v crictl >/dev/null 2>&1; then
+          CRI_ENDPOINT=""
+          if [ -r /etc/crictl.yaml ] && timeout 10 crictl ps -a -q >/dev/null 2>&1; then
+            CRICTL_OK=1
+            K8S_RUNTIME="crictl_default"
+          else
+            for sock in \
+              /run/containerd/containerd.sock \
+              /var/run/containerd/containerd.sock \
+              /run/crio/crio.sock \
+              /var/run/crio/crio.sock \
+              /run/k3s/containerd/containerd.sock \
+              /run/cri-dockerd.sock \
+              /var/run/cri-dockerd.sock \
+              /var/run/dockershim.sock; do
+              if [ -S "$sock" ]; then
+                if timeout 10 crictl --runtime-endpoint "unix://${sock}" ps -a -q >/dev/null 2>&1; then
+                  CRI_ENDPOINT="--runtime-endpoint unix://${sock}"
+                  CRICTL_OK=1
+                  K8S_RUNTIME=$(basename "$sock" .sock)
+                  break
+                fi
+              fi
+            done
+          fi
+
+          if [ "$CRICTL_OK" -eq 1 ]; then
+            K_ALL_OUT=$(timeout 15 crictl $CRI_ENDPOINT ps -a -q 2>/dev/null)
+            K_RUN_OUT=$(timeout 15 crictl $CRI_ENDPOINT ps -q 2>/dev/null)
+            K_ALL=$(printf '%s\n' "$K_ALL_OUT" | awk 'NF==1 && $1 ~ /^[0-9a-zA-Z_-]{8,}$/ && $1 != "CONTAINER" {c++} END{print c+0}')
+            K_RUN=$(printf '%s\n' "$K_RUN_OUT" | awk 'NF==1 && $1 ~ /^[0-9a-zA-Z_-]{8,}$/ && $1 != "CONTAINER" {c++} END{print c+0}')
+            if [ "$IS_K8S_NODE" -eq 1 ] || [ "$K_ALL" -gt 0 ]; then
+              K8S_STATUS="ok"
+              K8S_RUN=$K_RUN
+              K8S_STOP=$(( K_ALL > K_RUN ? K_ALL - K_RUN : 0 ))
+            else
+              K8S_RUNTIME="none"
+            fi
+          fi
+        fi
+
+        # Fallback 1: ctr (namespace k8s.io), если crictl не установлен
+        if [ "$K8S_STATUS" = "not_detected" ] && [ "$IS_K8S_NODE" -eq 1 ] && command -v ctr >/dev/null 2>&1; then
+          CTR_SOCK=""
+          for sock in /run/containerd/containerd.sock /var/run/containerd/containerd.sock /run/k3s/containerd/containerd.sock; do
+            [ -S "$sock" ] && CTR_SOCK="$sock" && break
+          done
+          if [ -n "$CTR_SOCK" ]; then
+            CTR_CONTAINERS=$(timeout 15 ctr --address "$CTR_SOCK" -n k8s.io containers ls 2>/dev/null)
+            if [ $? -eq 0 ]; then
+              K8S_STATUS="ok"
+              K8S_RUNTIME="containerd_ctr"
+              K_IDS=$(printf '%s\n' "$CTR_CONTAINERS" | awk 'NR>1 && $2 !~ /\/pause(:|@|$)/ {print $1}')
+              K_ALL=$(printf '%s\n' "$K_IDS" | awk 'NF{c++} END{print c+0}')
+              CTR_TASKS=$(timeout 15 ctr --address "$CTR_SOCK" -n k8s.io tasks ls 2>/dev/null | awk 'NR>1 && $3=="RUNNING" {print $1}')
+              K_RUN=$(printf '%s\n' "$CTR_TASKS" | awk 'NR==FNR{if(NF) r[$1]=1; next} (NF && ($1 in r)){c++} END{print c+0}' - <(printf '%s\n' "$K_IDS"))
+              K8S_RUN=$K_RUN
+              K8S_STOP=$(( K_ALL > K_RUN ? K_ALL - K_RUN : 0 ))
+            fi
+          fi
+        fi
+
+        # Fallback 2: K8s поверх Docker (dockershim / cri-dockerd без crictl)
+        if [ "$K8S_STATUS" = "not_detected" ] && [ $(( DOCKER_K8S_RUN + DOCKER_K8S_STOP )) -gt 0 ]; then
+          K8S_STATUS="ok"
+          K8S_RUNTIME="docker"
+          K8S_RUN=$DOCKER_K8S_RUN
+          K8S_STOP=$DOCKER_K8S_STOP
+        fi
+
+        TOTAL_RUN=$(( DOCKER_RUN + PODMAN_RUN + PODMAN_ROOTLESS_RUN + K8S_RUN ))
+        TOTAL_STOP=$(( DOCKER_STOP + PODMAN_STOP + PODMAN_ROOTLESS_STOP + K8S_STOP ))
+
+        printf '{"os":"%s","docker_status":"%s","docker_run":%d,"docker_stop":%d,"podman_status":"%s","podman_run":%d,"podman_stop":%d,"podman_rootless_run":%d,"podman_rootless_stop":%d,"k8s_status":"%s","k8s_runtime":"%s","k8s_run":%d,"k8s_stop":%d,"total_run":%d,"total_stop":%d}\n' \
+          "$OS_NAME" "$DOCKER_STATUS" "$DOCKER_RUN" "$DOCKER_STOP" \
+          "$PODMAN_STATUS" "$PODMAN_RUN" "$PODMAN_STOP" "$PODMAN_ROOTLESS_RUN" "$PODMAN_ROOTLESS_STOP" \
+          "$K8S_STATUS" "$K8S_RUNTIME" "$K8S_RUN" "$K8S_STOP" \
+          "$TOTAL_RUN" "$TOTAL_STOP"
+        {% endraw %}
+      args:
+        executable: /bin/bash
+      environment:
+        CHECK_ROOTLESS_PODMAN: "{{ '1' if (check_rootless_podman | bool) else '0' }}"
+      register: container_raw
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Парсинг JSON-результатов с хоста
+      ansible.builtin.set_fact:
+        container_stats: "{{ container_raw.stdout | trim | from_json }}"
+      when:
+        - container_raw is defined
+        - container_raw.rc is defined
+        - container_raw.rc == 0
+        - (container_raw.stdout | default('') | trim) is match('^\\{.*\\}$')
+      check_mode: false
+
+    - name: Фиксация имени файла отчёта
+      ansible.builtin.set_fact:
+        report_file_path: "{{ report_dir }}/containers_audit_{{ now(fmt='%Y%m%d_%H%M%S') }}.csv"
+      run_once: true
+      delegate_to: "{{ report_dest_host }}"
+      become: false
+      check_mode: false
+
+    - name: Формирование сводного CSV-отчёта (UTF-8 с BOM для Excel)
+      ansible.builtin.copy:
+        dest: "{{ report_file_path }}"
+        mode: "0644"
+        content: |
+          {{ '\ufeff' }}Host;Audit_Status;OS;Docker_Status;Docker_Running;Docker_Stopped;Podman_Status;Podman_Rootful_Running;Podman_Rootful_Stopped;Podman_Rootless_Running;Podman_Rootless_Stopped;K8s_Status;K8s_Runtime;K8s_Running;K8s_Stopped;Total_Running;Total_Stopped
+          {% for h in ansible_play_hosts_all | sort %}
+          {% set st = hostvars[h].container_stats | default({}) %}
+          {% if st | length > 0 %}
+          {{ h }};OK;{{ st.os }};{{ st.docker_status }};{{ st.docker_run }};{{ st.docker_stop }};{{ st.podman_status }};{{ st.podman_run }};{{ st.podman_stop }};{{ st.podman_rootless_run }};{{ st.podman_rootless_stop }};{{ st.k8s_status }};{{ st.k8s_runtime }};{{ st.k8s_run }};{{ st.k8s_stop }};{{ st.total_run }};{{ st.total_stop }}
+          {% else %}
+          {{ h }};UNREACHABLE_OR_ERROR;N/A;N/A;0;0;N/A;0;0;0;0;N/A;N/A;0;0;0;0
+          {% endif %}
+          {% endfor %}
+      run_once: true
+      delegate_to: "{{ report_dest_host }}"
+      become: false
+      check_mode: false
+
+    - name: Вывод итоговой сводки по всему парку в консоль
+      ansible.builtin.debug:
+        msg: |
+          {% set ns = namespace(
+            hosts_total=0, hosts_ok=0, hosts_err=0,
+            d_run=0, d_stop=0,
+            p_run=0, p_stop=0, pr_run=0, pr_stop=0,
+            k_run=0, k_stop=0,
+            t_run=0, t_stop=0,
+            docker_down=0
+          ) %}
+          {% for h in ansible_play_hosts_all %}
+            {% set ns.hosts_total = ns.hosts_total + 1 %}
+            {% set st = hostvars[h].container_stats | default({}) %}
+            {% if st | length > 0 %}
+              {% set ns.hosts_ok = ns.hosts_ok + 1 %}
+              {% set ns.d_run = ns.d_run + (st.docker_run | int) %}
+              {% set ns.d_stop = ns.d_stop + (st.docker_stop | int) %}
+              {% set ns.p_run = ns.p_run + (st.podman_run | int) %}
+              {% set ns.p_stop = ns.p_stop + (st.podman_stop | int) %}
+              {% set ns.pr_run = ns.pr_run + (st.podman_rootless_run | int) %}
+              {% set ns.pr_stop = ns.pr_stop + (st.podman_rootless_stop | int) %}
+              {% set ns.k_run = ns.k_run + (st.k8s_run | int) %}
+              {% set ns.k_stop = ns.k_stop + (st.k8s_stop | int) %}
+              {% set ns.t_run = ns.t_run + (st.total_run | int) %}
+              {% set ns.t_stop = ns.t_stop + (st.total_stop | int) %}
+              {% if st.docker_status == 'daemon_stopped' %}
+                {% set ns.docker_down = ns.docker_down + 1 %}
+              {% endif %}
+            {% else %}
+              {% set ns.hosts_err = ns.hosts_err + 1 %}
+            {% endif %}
+          {% endfor %}
+          ============================================================
+          ИТОГИ АУДИТА КОНТЕЙНЕРОВ
+          ============================================================
+          Хостов в инвентаре : {{ ns.hosts_total }} (опрошено: {{ ns.hosts_ok }}, недоступно/ошибка: {{ ns.hosts_err }})
+          Docker daemon выкл.: {{ ns.docker_down }} хост(ов)
+          ------------------------------------------------------------
+          Docker (standalone): запущено {{ ns.d_run }} | остановлено {{ ns.d_stop }}
+          Podman (rootful)   : запущено {{ ns.p_run }} | остановлено {{ ns.p_stop }}
+          Podman (rootless)  : запущено {{ ns.pr_run }} | остановлено {{ ns.pr_stop }}
+          Kubernetes (CRI)   : запущено {{ ns.k_run }} | остановлено {{ ns.k_stop }}
+          ------------------------------------------------------------
+          ВСЕГО              : запущено {{ ns.t_run }} | остановлено {{ ns.t_stop }}
+          CSV-отчёт сохранён : {{ report_dest_host }}:{{ report_file_path }}
+          ============================================================
+      run_once: true
+      delegate_to: "{{ report_dest_host }}"
+      become: false
+      check_mode: false

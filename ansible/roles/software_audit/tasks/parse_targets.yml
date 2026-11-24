@@ -1,0 +1,42 @@
+---
+- name: Разобрать список профилей аудита
+  ansible.builtin.set_fact:
+    software_audit_targets_list: "{{ _resolved_targets }}"
+  vars:
+    _raw_input: >-
+      {{
+        targets
+        | default(software_audit_targets | default(software_audit_target | default('', true), true), true)
+      }}
+    _raw_list: >-
+      {{
+        _raw_input
+        if (_raw_input is sequence and _raw_input is not string)
+        else (_raw_input | string | replace(';', ',') | split(','))
+      }}
+    _cleaned: >-
+      {{
+        _raw_list
+        | map('string')
+        | map('trim')
+        | map('lower')
+        | reject('equalto', '')
+        | unique
+        | list
+      }}
+    _resolved_targets: >-
+      {{
+        (software_audit_profiles.keys() | sort | list)
+        if ('all' in _cleaned)
+        else _cleaned
+      }}
+
+- name: Проверить корректность указанных профилей аудита
+  ansible.builtin.assert:
+    that:
+      - software_audit_targets_list | length > 0
+      - (software_audit_targets_list | difference(software_audit_profiles.keys() | list)) | length == 0
+    fail_msg: >-
+      Некорректные или пустые профили аудита:
+      {{ software_audit_targets_list | difference(software_audit_profiles.keys() | list) | join(', ') }}.
+      Доступные профили: {{ software_audit_profiles.keys() | sort | join(', ') }} (или 'all').
