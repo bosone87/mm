@@ -1,0 +1,41 @@
+---
+- name: Создать каталог для отчетов на adm.lin
+  ansible.builtin.file:
+    path: "{{ report_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Сохранить единый CSV-отчет на adm.lin
+  ansible.builtin.copy:
+    dest: "{{ report_dir }}/{{ audit_target }}_audit_{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}.csv"
+    mode: "0644"
+    content: |
+      host{{ csv_sep }}os{{ csv_sep }}pkg_mgr{{ csv_sep }}target{{ csv_sep }}scope{{ csv_sep }}source_or_runtime{{ csv_sep }}name{{ csv_sep }}status{{ csv_sep }}version{{ csv_sep }}details
+      {% set target_hosts_list = audited_hosts | default(query('inventory_hostnames', hosts | default('', true) | string | replace(';', ',') | split(',') | map('trim') | reject('equalto', '') | join(','))) -%}
+      {% for h in target_hosts_list -%}
+      {% set hv = hostvars[h] | default({}) -%}
+      {% if hv.host_found_packages is defined -%}
+      {% set os_name = ((hv.ansible_facts.distribution | default('Unknown')) ~ ' ' ~ (hv.ansible_facts.distribution_version | default(''))) | trim -%}
+      {% set pm = hv.ansible_facts.pkg_mgr | default('unknown') -%}
+      {% set src = hv.facts_source | default('package_facts') -%}
+      {% if hv.host_found_packages | length > 0 -%}
+      {% for pkg_name, pkg_vers in hv.host_found_packages.items() -%}
+      "{{ h }}"{{ csv_sep }}"{{ os_name }}"{{ csv_sep }}"{{ pm }}"{{ csv_sep }}"{{ audit_target }}"{{ csv_sep }}"host"{{ csv_sep }}"{{ src }}"{{ csv_sep }}"{{ pkg_name }}"{{ csv_sep }}"installed"{{ csv_sep }}"{{ pkg_vers | join('; ') }}"{{ csv_sep }}""
+      {% endfor -%}
+      {% elif hv.host_unmanaged_binary | default({}) | length > 0 -%}
+      "{{ h }}"{{ csv_sep }}"{{ os_name }}"{{ csv_sep }}"{{ pm }}"{{ csv_sep }}"{{ audit_target }}"{{ csv_sep }}"host"{{ csv_sep }}"binary_unmanaged"{{ csv_sep }}"{{ hv.host_unmanaged_binary.path }}"{{ csv_sep }}"installed_unmanaged"{{ csv_sep }}"{{ hv.host_unmanaged_binary.version }}"{{ csv_sep }}""
+      {% else -%}
+      "{{ h }}"{{ csv_sep }}"{{ os_name }}"{{ csv_sep }}"{{ pm }}"{{ csv_sep }}"{{ audit_target }}"{{ csv_sep }}"host"{{ csv_sep }}"{{ src }}"{{ csv_sep }}"{{ hv.host_expected_packages | default([audit_target]) | join(' / ') }}"{{ csv_sep }}"missing"{{ csv_sep }}""{{ csv_sep }}""
+      {% endif -%}
+      {% for c in hv.host_found_containers | default([]) -%}
+      "{{ h }}"{{ csv_sep }}"{{ os_name }}"{{ csv_sep }}"{{ pm }}"{{ csv_sep }}"{{ audit_target }}"{{ csv_sep }}"container"{{ csv_sep }}"{{ c.runtime }}"{{ csv_sep }}"{{ c.name }}"{{ csv_sep }}"{{ c.status }}"{{ csv_sep }}"{{ c.version }}"{{ csv_sep }}"id={{ c.id }}; image={{ c.image }}"
+      {% endfor -%}
+      {% else -%}
+      "{{ h }}"{{ csv_sep }}"unknown"{{ csv_sep }}"unknown"{{ csv_sep }}"{{ audit_target }}"{{ csv_sep }}"host"{{ csv_sep }}"none"{{ csv_sep }}""{{ csv_sep }}"unreachable_or_failed"{{ csv_sep }}""{{ csv_sep }}""
+      {% endif -%}
+      {% endfor -%}
+  register: csv_report
+
+- name: Показать путь к сохраненному отчету на adm.lin
+  ansible.builtin.debug:
+    msg: "CSV-отчет по {{ audit_target }} сохранен на adm.lin: {{ csv_report.dest }}"

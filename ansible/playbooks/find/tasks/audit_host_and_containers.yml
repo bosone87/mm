@@ -1,0 +1,207 @@
+---
+- name: Определить семейство пакетного менеджера и список пакетов
+  ansible.builtin.set_fact:
+    pkg_family: "{{ 'deb' if ansible_facts.pkg_mgr == 'apt' else 'rpm' }}"
+    host_expected_packages: "{{ target_deb_packages if ansible_facts.pkg_mgr == 'apt' else target_rpm_packages }}"
+
+- name: Сбор пакетов на хосте через package_facts с fallback для legacy/minimal ОС
+  block:
+    - name: Собрать package_facts
+      ansible.builtin.package_facts:
+        manager: "{{ 'apt' if pkg_family == 'deb' else 'rpm' }}"
+
+    - name: Отобрать целевые пакеты из package_facts
+      ansible.builtin.set_fact:
+        host_found_packages: "{{ _raw_info | from_json }}"
+        facts_source: "package_facts"
+      vars:
+        _raw_info: >-
+          {% set res = {} %}
+          {% for pkg in host_expected_packages %}
+            {% if pkg in ansible_facts.packages %}
+              {% set vers = [] %}
+              {% for p in ansible_facts.packages[pkg] %}
+                {% set ver = p.version ~ ('-' ~ p.release if (p.release is defined and p.release) else '') %}
+                {% if ver not in vers %}
+                  {% set _ = vers.append(ver) %}
+                {% endif %}
+              {% endfor %}
+              {% set _ = res.update({pkg: vers}) %}
+            {% endif %}
+          {% endfor %}
+          {{ res | to_json }}
+
+  rescue:
+    - name: Fallback для RPM (РЕД ОС, RHEL, CentOS, Oracle Linux)
+      ansible.builtin.command:
+        argv:
+          - rpm
+          - -qa
+          - --qf
+          - "%{NAME}|%{VERSION}-%{RELEASE}\n"
+      register: rpm_fallback
+      changed_when: false
+      when: pkg_family == 'rpm'
+
+    - name: Fallback для DEB (Ubuntu)
+      ansible.builtin.command:
+        argv:
+          - dpkg-query
+          - -W
+          - "-f=${Status}|${Package}|${Version}\n"
+      register: deb_fallback
+      changed_when: false
+      when: pkg_family == 'deb'
+
+    - name: Отобрать целевые пакеты из CLI fallback
+      ansible.builtin.set_fact:
+        host_found_packages: "{{ _raw_info | from_json }}"
+        facts_source: "cli_fallback"
+      vars:
+        _lines: >-
+          {{
+            (deb_fallback.stdout_lines | default([]))
+            if pkg_family == 'deb'
+            else (rpm_fallback.stdout_lines | default([]))
+          }}
+        _raw_info: >-
+          {% set res = {} %}
+          {% for line in _lines %}
+            {% set parts = line.split('|') %}
+            {% set valid = (parts | length == 3 and parts[0] == 'install ok installed') if pkg_family == 'deb' else (parts | length == 2) %}
+            {% if valid %}
+              {% set pkg_name = parts[1] if pkg_family == 'deb' else parts[0] %}
+              {% set pkg_ver = parts[2] if pkg_family == 'deb' else parts[1] %}
+              {% if pkg_name in host_expected_packages %}
+                {% set cur = res.get(pkg_name, []) %}
+                {% if pkg_ver not in cur %}
+                  {% set _ = res.update({pkg_name: cur + [pkg_ver]}) %}
+                {% endif %}
+              {% endif %}
+            {% endif %}
+          {% endfor %}
+          {{ res | to_json }}
+
+- name: Проверить наличие бинарника на хосте (если пакет не найден в БД пакетного менеджера)
+  ansible.builtin.shell: |
+    {% raw %}
+    for bin_name in $HOST_BINS; do
+      bin_path=$(command -v "$bin_name" 2>/dev/null || true)
+      if [ -n "$bin_path" ]; then
+        bin_ver=$(sh -c "$VERSION_CMD" 2>/dev/null | tr '\r\n"|' '   ' | sed 's/^ *//; s/ *$//' | cut -c1-120 || true)
+        printf '%s|%s\n' "$bin_path" "${bin_ver:-unknown}"
+        break
+      fi
+    done
+    {% endraw %}
+  args:
+    executable: /bin/sh
+  environment:
+    HOST_BINS: "{{ target_host_binaries | join(' ') }}"
+    VERSION_CMD: "{{ target_version_cmd }}"
+  register: host_bin_check
+  changed_when: false
+  failed_when: false
+  when: host_found_packages | length == 0
+
+- name: Сохранить данные о найденном бинарнике без пакета
+  ansible.builtin.set_fact:
+    host_unmanaged_binary: >-
+      {{
+        {
+          'path': host_bin_check.stdout.split('|')[0],
+          'version': host_bin_check.stdout.split('|')[1] | default('unknown')
+        }
+        if (host_bin_check.stdout | default('') | trim | length > 0)
+        else {}
+      }}
+
+- name: Поиск целевого ПО в контейнерах (Docker, Podman, nerdctl)
+  ansible.builtin.shell: |
+    {% raw %}
+    check_runtime() {
+      rt="$1"
+      prefix="$2"
+      if ! $prefix "$rt" ps -a --format '{{.ID}}' >/dev/null 2>&1; then
+        return 0
+      fi
+      $prefix "$rt" ps -a --no-trunc --format '{{.ID}}|{{.Names}}|{{.Image}}|{{.Status}}|{{.Command}}' 2>/dev/null | \
+      while IFS='|' read -r cid cname cimage cstatus ccmd; do
+        haystack="${cname} ${cimage} ${ccmd}"
+        if printf '%s\n' "$haystack" | grep -Eiq "$TARGET_REGEX"; then
+          state="stopped"
+          case "$cstatus" in
+            Up*|up*|running*|Running*) state="running" ;;
+          esac
+          cver=""
+          if [ "$state" = "running" ] && [ -n "${VERSION_CMD:-}" ]; then
+            cver=$(timeout 3 $prefix "$rt" exec "$cid" sh -c "$VERSION_CMD" 2>/dev/null | tr '\r\n"|' '   ' | sed 's/^ *//; s/ *$//' | cut -c1-120 || true)
+          fi
+          if [ -z "$cver" ]; then
+            case "$cimage" in
+              *:*) cver="image:${cimage##*:}" ;;
+              *) cver="image:untagged" ;;
+            esac
+          fi
+          short_id=$(printf '%s' "$cid" | cut -c1-12)
+          safe_name=$(printf '%s' "$cname" | tr '"|' '  ')
+          safe_image=$(printf '%s' "$cimage" | tr '"|' '  ')
+          safe_status=$(printf '%s' "$cstatus" | tr '"|' '  ')
+          printf '%s|%s|%s|%s|%s|%s\n' "$rt" "$short_id" "$safe_name" "$safe_image" "$safe_status" "$cver"
+        fi
+      done
+    }
+
+    for rt in docker podman nerdctl; do
+      command -v "$rt" >/dev/null 2>&1 || continue
+      if [ "$(id -u)" -eq 0 ]; then
+        check_runtime "$rt" ""
+      elif sudo -n "$rt" ps -a --format '{{.ID}}' >/dev/null 2>&1; then
+        check_runtime "$rt" "sudo -n"
+        if [ "$rt" = "podman" ]; then
+          check_runtime "$rt" ""
+        fi
+      else
+        check_runtime "$rt" ""
+      fi
+    done | sort -u
+    {% endraw %}
+  args:
+    executable: /bin/sh
+  environment:
+    TARGET_REGEX: "{{ target_container_regex }}"
+    VERSION_CMD: "{{ target_version_cmd }}"
+  register: container_scan
+  changed_when: false
+  failed_when: false
+
+- name: Разобрать список найденных контейнеров
+  ansible.builtin.set_fact:
+    host_found_containers: "{{ _containers | from_json }}"
+  vars:
+    _containers: >-
+      {% set res = [] %}
+      {% for line in (container_scan.stdout_lines | default([])) %}
+        {% set p = line.split('|') %}
+        {% if p | length >= 6 %}
+          {% set _ = res.append({
+            'runtime': p[0],
+            'id': p[1],
+            'name': p[2],
+            'image': p[3],
+            'status': p[4],
+            'version': p[5]
+          }) %}
+        {% endif %}
+      {% endfor %}
+      {{ res | to_json }}
+
+- name: Вывод результатов проверки на экран по хосту
+  ansible.builtin.debug:
+    msg:
+      target: "{{ audit_target }}"
+      host: "{{ inventory_hostname }}"
+      os: "{{ ansible_facts.distribution | default('Unknown') }} {{ ansible_facts.distribution_version | default('') }}"
+      host_packages: "{{ host_found_packages }}"
+      host_unmanaged_binary: "{{ host_unmanaged_binary }}"
+      containers: "{{ host_found_containers }}"

@@ -1,0 +1,46 @@
+---
+- name: Поиск httpd (apache2) на хостах и в контейнерах
+  hosts: "{{ hosts | default('', true) | string | replace(';', ',') | split(',') | map('trim') | reject('equalto', '') | list }}"
+  strategy: free
+  gather_facts: true
+  gather_subset:
+    - "!all"
+    - "!min"
+    - "distribution"
+    - "pkg_mgr"
+
+  vars:
+    audit_target: "httpd"
+    target_rpm_packages:
+      - httpd
+      - httpd24-httpd
+    target_deb_packages:
+      - apache2
+    target_host_binaries:
+      - httpd
+      - apache2
+    # Исключает ложные срабатывания на образы Apache Foundation (kafka, airflow, spark, solr и др.)
+    target_container_regex: "(^|[/:_-])(httpd|apache2)([/:_.-]|$)|php[^ ]*-apache"
+    target_version_cmd: "httpd -v 2>/dev/null | head -n1 || apache2 -v 2>/dev/null | head -n1"
+
+  tasks:
+    - name: Передать список целевых хостов на adm.lin
+      ansible.builtin.set_fact:
+        audited_hosts: "{{ ansible_play_hosts_all }}"
+      delegate_to: adm.lin
+      delegate_facts: true
+      run_once: true
+
+    - name: Выполнить проверку хоста и контейнеров
+      ansible.builtin.import_tasks: tasks/audit_host_and_containers.yml
+
+- name: Сохранить единый CSV-отчет по httpd (apache2) на adm.lin
+  hosts: adm.lin
+  gather_facts: false
+  vars:
+    audit_target: "httpd"
+    report_dir: "/tmp/ansible_reports"
+    csv_sep: ","
+  tasks:
+    - name: Сформировать и сохранить CSV-отчет
+      ansible.builtin.import_tasks: tasks/save_csv_report.yml

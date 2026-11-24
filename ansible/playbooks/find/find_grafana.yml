@@ -1,0 +1,49 @@
+---
+- name: Поиск Grafana на хостах и в контейнерах
+  hosts: "{{ hosts | default('', true) | string | replace(';', ',') | split(',') | map('trim') | reject('equalto', '') | list }}"
+  strategy: free
+  gather_facts: true
+  gather_subset:
+    - "!all"
+    - "!min"
+    - "distribution"
+    - "pkg_mgr"
+
+  vars:
+    audit_target: "grafana"
+    target_rpm_packages:
+      - grafana
+      - grafana-enterprise
+      - grafana-oss
+    target_deb_packages:
+      - grafana
+      - grafana-enterprise
+      - grafana-oss
+    target_host_binaries:
+      - grafana-server
+      - grafana
+    # Регулярное выражение для поиска по имени, образу и команде контейнера
+    target_container_regex: "grafana"
+    target_version_cmd: "grafana server -v 2>/dev/null || grafana-server -v 2>/dev/null"
+
+  tasks:
+    - name: Передать список целевых хостов на adm.lin
+      ansible.builtin.set_fact:
+        audited_hosts: "{{ ansible_play_hosts_all }}"
+      delegate_to: adm.lin
+      delegate_facts: true
+      run_once: true
+
+    - name: Выполнить проверку хоста и контейнеров
+      ansible.builtin.import_tasks: tasks/audit_host_and_containers.yml
+
+- name: Сохранить единый CSV-отчет по Grafana на adm.lin
+  hosts: adm.lin
+  gather_facts: false
+  vars:
+    audit_target: "grafana"
+    report_dir: "/tmp/ansible_reports"
+    csv_sep: ","
+  tasks:
+    - name: Сформировать и сохранить CSV-отчет
+      ansible.builtin.import_tasks: tasks/save_csv_report.yml
