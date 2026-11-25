@@ -4,6 +4,12 @@
   become: true
   gather_facts: false
   ignore_unreachable: true
+  vars:
+    report_host: "adm.lin"
+    report_dir: "~/cve-reports"
+    report_become: false
+    include_clean_hosts: true
+    scan_timeout: 10
 
   tasks:
     - name: Read-only сканирование хоста и контейнерных сред (один SSH-вызов)
@@ -14,140 +20,187 @@
           set -u
           export LC_ALL=C
 
+          TO="${SCAN_TIMEOUT:-10}"
+          if command -v timeout >/dev/null 2>&1; then
+            HAS_TIMEOUT=1
+          else
+            HAS_TIMEOUT=0
+          fi
+
           run_to() {
-            if command -v timeout >/dev/null 2>&1; then
-              timeout 10 "$@"
+            if [ "$HAS_TIMEOUT" -eq 1 ]; then
+              timeout "$TO" "$@"
             else
               "$@"
             fi
           }
 
-          extract_ver() {
-            sed -n 's/.*<version>\([^<]*\)<\/version>.*/\1/p' "$1" 2>/dev/null | head -n 1 | tr -d ' \t\r\n'
+          strip_q() {
+            s="$1"
+            s="${s#\"}"
+            s="${s%\"}"
+            s="${s#\'}"
+            s="${s%\'}"
+            printf '%s' "$s"
           }
 
-          OS_ID="unknown"
-          if [ -r /etc/os-release ]; then
-            OS_ID=$(awk -F= '/^ID=/{gsub(/"/,"",$2); print $2; exit}' /etc/os-release 2>/dev/null)
-          fi
-          printf 'OS|%s\n' "${OS_ID:-unknown}"
+          extract_ver() {
+            sed -n 's/.*<version>[[:space:]]*\([^<[:space:]]*\)[[:space:]]*<\/version>.*/\1/p' "$1" 2>/dev/null \
+              | head -n 1 | tr -d '\r'
+          }
 
           emit() {
             # FIND|runtime|target|image|path|version|state
             printf 'FIND|%s|%s|%s|%s|%s|%s\n' "$1" "$2" "$3" "$4" "$5" "$6"
           }
 
-          # 1. Хостовые пути Nextcloud и стандартные директории томов (с -xdev и пропуском data/)
-          HOST_PATHS="/var/www /srv /opt /usr/share/webapps /usr/share/nextcloud /var/snap/nextcloud /var/lib/docker/volumes /var/lib/containers/storage/volumes"
-          for base in $HOST_PATHS; do
-            [ -d "$base" ] || continue
-            run_to find "$base" -xdev -maxdepth 8 \
-              \( -name data -o -name .git \) -prune -o \
-              -type f -path '*/user_oidc/appinfo/info.xml' -print 2>/dev/null | while IFS= read -r f; do
+          scan_dir() {
+            d="$1"; depth="$2"; rt="$3"; tgt="$4"; img="$5"; pfx="$6"
+            [ -d "$d" ] || return 0
+            run_to find "$d" -xdev -maxdepth "$depth" \
+              -mindepth 1 \( -name data -o -name .git -o -name node_modules -o -name cache \) -prune -o \
+              -type f -name info.xml -path '*/user_oidc/appinfo/info.xml' -print 2>/dev/null | while IFS= read -r f; do
                 [ -n "$f" ] || continue
                 ver=$(extract_ver "$f")
-                emit "host" "filesystem" "-" "$f" "${ver:-unknown}" "unknown"
+                emit "$rt" "$tgt" "$img" "${pfx}${f}" "${ver:-unknown}" "unknown"
             done
+          }
+
+          # 0. Определение ОС без лишних форков
+          OS_ID="unknown"
+          OS_VER=""
+          if [ -r /etc/os-release ]; then
+            while IFS='=' read -r k v; do
+              case "$k" in
+                ID) OS_ID=$(strip_q "$v") ;;
+                VERSION_ID) OS_VER=$(strip_q "$v") ;;
+              esac
+            done < /etc/os-release
+          fi
+          if [ -n "$OS_VER" ]; then
+            printf 'OS|%s %s\n' "$OS_ID" "$OS_VER"
+          else
+            printf 'OS|%s\n' "$OS_ID"
+          fi
+
+          # 1. Хостовые пути Nextcloud и директории томов (включая rootless Podman)
+          for base in \
+            /var/www /srv /opt /usr/share/webapps /usr/share/nextcloud \
+            /var/snap/nextcloud /var/lib/docker/volumes /var/lib/containers/storage/volumes; do
+            scan_dir "$base" 8 "host" "filesystem" "-" ""
+          done
+
+          for rvol in /home/*/.local/share/containers/storage/volumes; do
+            [ -d "$rvol" ] && scan_dir "$rvol" 8 "podman-rootless" "volume" "-" ""
           done
 
           # 2. Контейнерные рантаймы: docker, podman, nerdctl
           for rt in docker podman nerdctl; do
             command -v "$rt" >/dev/null 2>&1 || continue
-            run_to "$rt" ps -q >/dev/null 2>&1 || continue
+            cids=$(run_to "$rt" ps -a -q 2>/dev/null) || continue
+            [ -n "$cids" ] || continue
 
-            run_to "$rt" ps -a -q 2>/dev/null | while IFS= read -r cid; do
+            # Один batch-вызов inspect на все контейнеры рантайма
+            set -f
+            # shellcheck disable=SC2086
+            inspect_out=$(run_to "$rt" inspect --format \
+              '{{.Id}}|{{.Name}}|{{.Config.Image}}|{{.State.Status}}|{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}};{{end}}{{end}}' \
+              $cids 2>/dev/null)
+            set +f
+
+            [ -n "$inspect_out" ] || continue
+
+            printf '%s\n' "$inspect_out" | while IFS='|' read -r cid cname cimg cstatus cmounts; do
               [ -n "$cid" ] || continue
-              meta=$(run_to "$rt" inspect --format '{{.Name}}|{{.Config.Image}}|{{.State.Status}}' "$cid" 2>/dev/null | sed 's|^/||')
-              cname=$(printf '%s' "$meta" | cut -d'|' -f1)
-              cimg=$(printf '%s' "$meta" | cut -d'|' -f2)
-              cstatus=$(printf '%s' "$meta" | cut -d'|' -f3)
+              cname="${cname#/}"
 
               # 2a. Проверка bind-монтирований на хосте (включая остановленные контейнеры)
-              run_to "$rt" inspect --format '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}{{"\n"}}{{end}}{{end}}' "$cid" 2>/dev/null | while IFS= read -r msrc; do
-                [ -d "$msrc" ] || continue
-                case "$msrc" in
-                  /|/etc|/var|/usr|/proc|/sys|/dev|/run|/tmp) continue ;;
-                esac
-                run_to find "$msrc" -xdev -maxdepth 5 \
-                  \( -name data -o -name .git \) -prune -o \
-                  -type f -path '*/user_oidc/appinfo/info.xml' -print 2>/dev/null | while IFS= read -r f; do
-                    [ -n "$f" ] || continue
-                    ver=$(extract_ver "$f")
-                    emit "$rt" "${cname}(${cstatus})" "$cimg" "bind:${f}" "${ver:-unknown}" "unknown"
+              if [ -n "$cmounts" ]; then
+                old_ifs="$IFS"
+                IFS=';'
+                set -f
+                for msrc in $cmounts; do
+                  set +f
+                  IFS="$old_ifs"
+                  [ -d "$msrc" ] || continue
+                  case "$msrc" in
+                    /|/etc|/var|/usr|/proc|/sys|/dev|/run|/tmp|/boot|/lib|/lib64|/bin|/sbin) continue ;;
+                  esac
+                  scan_dir "$msrc" 5 "$rt" "${cname}(${cstatus})" "$cimg" "bind:"
                 done
-              done
+                set +f
+                IFS="$old_ifs"
+              fi
 
-              # 2b. Проверка внутри запущенного контейнера (модули в образе/overlay + статус через occ)
+              # 2b. Проверка внутри запущенного контейнера (1 быстрый exec; occ вызывается только при находке)
               if [ "$cstatus" = "running" ]; then
-                in_res=$(run_to "$rt" exec "$cid" sh -c '
-                  found=0
-                  for base in /var/www/html /var/www/nextcloud /config/www/nextcloud /usr/src/nextcloud /app/www/public; do
-                    [ -d "$base" ] || continue
-                    if [ -f "$base/occ" ] || [ -f "$base/version.php" ]; then
-                      find "$base" -xdev -maxdepth 4 \( -name data -o -name .git \) -prune -o \
-                        -type f -path "*/user_oidc/appinfo/info.xml" -print 2>/dev/null | while IFS= read -r p; do
-                          [ -r "$p" ] || continue
-                          v=$(sed -n "s/.*<version>\([^<]*\)<\/version>.*/\1/p" "$p" 2>/dev/null | head -n 1 | tr -d " \t\r\n")
-                          echo "${p}|${v:-unknown}"
+                in_out=$(run_to "$rt" exec "$cid" sh -c '
+                  occ_printed=0
+                  check_xml() {
+                    if [ -r "$1" ]; then
+                      v=$(sed -n "s/.*<version>[[:space:]]*\([^<[:space:]]*\)[[:space:]]*<\/version>.*/\1/p" "$1" 2>/dev/null | head -n 1 | tr -d "\r")
+                      printf "XML|%s|%s\n" "$1" "${v:-unknown}"
+                    fi
+                  }
+                  for b in /var/www/html /var/www/nextcloud /config/www/nextcloud /usr/src/nextcloud /app/www/public; do
+                    [ -d "$b" ] || continue
+                    if [ "$occ_printed" -eq 0 ] && [ -f "$b/occ" ]; then
+                      u=$(stat -c "%u" "$b/occ" 2>/dev/null || ls -ln "$b/occ" 2>/dev/null | awk "{print \$3}")
+                      printf "OCC|%s|%s\n" "${u:-}" "$b/occ"
+                      occ_printed=1
+                    fi
+                    hit=0
+                    for rel in custom_apps/user_oidc/appinfo/info.xml apps/user_oidc/appinfo/info.xml; do
+                      if [ -r "$b/$rel" ]; then
+                        check_xml "$b/$rel"
+                        hit=1
+                      fi
+                    done
+                    if [ "$hit" -eq 0 ] && { [ -f "$b/occ" ] || [ -f "$b/version.php" ]; }; then
+                      find "$b" -xdev -maxdepth 4 -mindepth 1 \( -name data -o -name .git \) -prune -o \
+                        -type f -name info.xml -path "*/user_oidc/appinfo/info.xml" -print 2>/dev/null | while IFS= read -r p; do
+                          check_xml "$p"
                       done
-                      found=1
                     fi
                   done
-                  if [ "$found" -eq 0 ]; then
-                    for p in \
-                      /var/www/html/custom_apps/user_oidc/appinfo/info.xml \
-                      /var/www/html/apps/user_oidc/appinfo/info.xml \
-                      /config/www/nextcloud/apps/user_oidc/appinfo/info.xml; do
-                      if [ -r "$p" ]; then
-                        v=$(sed -n "s/.*<version>\([^<]*\)<\/version>.*/\1/p" "$p" 2>/dev/null | head -n 1 | tr -d " \t\r\n")
-                        echo "${p}|${v:-unknown}"
-                      fi
-                    done
-                  fi
                 ' 2>/dev/null)
 
-                if [ -n "$in_res" ]; then
-                  app_state="unknown"
-                  # Определяем UID владельца occ, чтобы НЕ запускать php occ от root
-                  occ_info=$(run_to "$rt" exec "$cid" sh -c '
-                    for o in /var/www/html/occ /var/www/nextcloud/occ /config/www/nextcloud/occ /app/www/public/occ; do
-                      if [ -f "$o" ]; then
-                        u=$(stat -c "%u" "$o" 2>/dev/null || ls -ln "$o" 2>/dev/null | awk "{print \$3}")
-                        echo "${u}|${o}"
-                        break
-                      fi
+                case "$in_out" in
+                  *'XML|'*)
+                    app_state="unknown"
+                    occ_line=$(printf '%s\n' "$in_out" | awk -F'|' '$1=="OCC"{print $2"|"$3; exit}')
+                    occ_uid="${occ_line%%|*}"
+                    occ_path="${occ_line#*|}"
+
+                    case "$occ_uid" in
+                      ''|0|*[!0-9]*) ;;
+                      *)
+                        occ_out=$(run_to "$rt" exec -u "$occ_uid" "$cid" php "$occ_path" app:list --no-ansi 2>/dev/null)
+                        if [ -n "$occ_out" ]; then
+                          app_state=$(printf '%s\n' "$occ_out" | awk '
+                            /^Enabled:/ { sec="enabled"; next }
+                            /^Disabled:/ { sec="disabled"; next }
+                            /^[[:space:]]*-[[:space:]]*user_oidc:/ { print sec; exit }
+                          ')
+                          [ -n "$app_state" ] || app_state="not_registered"
+                        fi
+                        ;;
+                    esac
+
+                    printf '%s\n' "$in_out" | while IFS='|' read -r tag ipath iver; do
+                      [ "$tag" = "XML" ] && [ -n "$ipath" ] || continue
+                      emit "$rt" "${cname}(running)" "$cimg" "$ipath" "$iver" "$app_state"
                     done
-                  ' 2>/dev/null | head -n 1)
-
-                  occ_uid=$(printf '%s' "$occ_info" | cut -d'|' -f1)
-                  occ_path=$(printf '%s' "$occ_info" | cut -d'|' -f2)
-
-                  case "$occ_uid" in
-                    ''|0|*[!0-9]*) ;;
-                    *)
-                      occ_out=$(run_to "$rt" exec -u "$occ_uid" "$cid" php "$occ_path" app:list --no-ansi 2>/dev/null)
-                      if [ -n "$occ_out" ]; then
-                        app_state=$(printf '%s\n' "$occ_out" | awk '
-                          /^Enabled:/ { sec="enabled"; next }
-                          /^Disabled:/ { sec="disabled"; next }
-                          /^[[:space:]]*-[[:space:]]*user_oidc:/ { print sec; exit }
-                        ')
-                        [ -n "$app_state" ] || app_state="not_registered"
-                      fi
-                      ;;
-                  esac
-
-                  printf '%s\n' "$in_res" | while IFS='|' read -r ipath iver; do
-                    [ -n "$ipath" ] || continue
-                    emit "$rt" "${cname}(running)" "$cimg" "$ipath" "$iver" "$app_state"
-                  done
-                fi
+                    ;;
+                esac
               fi
             done
           done
 
           exit 0
           {% endraw %}
+      environment:
+        SCAN_TIMEOUT: "{{ scan_timeout | int }}"
       register: scan_raw
       changed_when: false
       check_mode: false
@@ -156,91 +209,86 @@
     - name: Классификация версий user_oidc по CVE-2026-45156
       ansible.builtin.set_fact:
         cve_findings: >-
-          {%- set lines = scan_raw.stdout_lines | default([]) -%}
-          {%- set os_val = 'unknown' -%}
-          {%- set raw_finds = [] -%}
-          {%- for l in lines -%}
+          {%- set ns = namespace(os_val='неизвестно', raw_finds=[], rows=[]) -%}
+          {%- set state_map = {
+            'enabled': 'включён',
+            'disabled': 'отключён',
+            'not_registered': 'не зарегистрирован',
+            'unknown': 'неизвестно'
+          } -%}
+          {%- for l in scan_raw.stdout_lines | default([]) -%}
             {%- if l.startswith('OS|') -%}
-              {%- set os_val = l.split('|', 1)[1] -%}
+              {%- set ns.os_val = l.split('|', 1)[1] -%}
             {%- elif l.startswith('FIND|') -%}
-              {%- set _ = raw_finds.append(l) -%}
+              {%- set _ = ns.raw_finds.append(l) -%}
             {%- endif -%}
           {%- endfor -%}
-          {%- set rows = [] -%}
           {%- if scan_raw.rc | default(1) != 0 -%}
-            {%- set _ = rows.append({
+            {%- set _ = ns.rows.append({
               'host': inventory_hostname,
-              'os': os_val,
+              'os': ns.os_val,
               'runtime': '-',
               'target': '-',
               'image': '-',
               'path': '-',
               'version': '-',
               'app_state': '-',
-              'cve_status': 'SCAN_ERROR',
-              'details': (scan_raw.stderr | default('script execution failed') | replace('\n', ' ') | trim)[:150]
+              'cve_status': 'ОШИБКА СКАНИРОВАНИЯ',
+              'details': (scan_raw.stderr | default('ошибка выполнения скрипта') | replace('\n', ' ') | trim)[:150]
             }) -%}
-          {%- elif raw_finds | length == 0 -%}
-            {%- set _ = rows.append({
+          {%- elif ns.raw_finds | length == 0 -%}
+            {%- set _ = ns.rows.append({
               'host': inventory_hostname,
-              'os': os_val,
+              'os': ns.os_val,
               'runtime': '-',
               'target': '-',
               'image': '-',
               'path': '-',
               'version': '-',
               'app_state': '-',
-              'cve_status': 'NOT_FOUND',
-              'details': 'user_oidc not detected'
+              'cve_status': 'НЕ НАЙДЕН',
+              'details': 'Модуль user_oidc не обнаружен'
             }) -%}
           {%- else -%}
-            {%- for item in (raw_finds | unique) -%}
+            {%- for item in (ns.raw_finds | unique) -%}
               {%- set p = item.split('|') -%}
               {%- set v = p[5] | default('unknown') -%}
+              {%- set raw_st = p[6] | default('unknown') -%}
               {%- if v == 'unknown' or not (v is match('^[0-9]+(\\.[0-9]+)+([-.][A-Za-z0-9]+)?$')) -%}
-                {%- set status = 'UNKNOWN_VERSION' -%}
-                {%- set details = 'Cannot parse version; manual verification required' -%}
+                {%- set status = 'ВЕРСИЯ НЕ ОПРЕДЕЛЕНА' -%}
+                {%- set details = 'Не удалось разобрать версию; требуется ручная проверка' -%}
               {%- elif (v is ansible.builtin.version('0.3.0', '>=') and v is ansible.builtin.version('3.1.0', '<'))
                     or (v is ansible.builtin.version('4.0.0', '>=') and v is ansible.builtin.version('4.1.0', '<'))
                     or (v is ansible.builtin.version('5.0.0', '>=') and v is ansible.builtin.version('5.1.0', '<'))
                     or (v is ansible.builtin.version('6.0.0', '>=') and v is ansible.builtin.version('6.4.0', '<')) -%}
-                {%- set status = 'VULNERABLE' -%}
-                {%- set details = 'Update user_oidc to >=3.1.0 / 4.1.0 / 5.1.0 / 6.4.0' -%}
+                {%- set status = 'УЯЗВИМ' -%}
+                {%- set details = 'Обновите user_oidc до 3.1.0 / 4.1.0 / 5.1.0 / 6.4.0 или выше' -%}
               {%- else -%}
-                {%- set status = 'PATCHED' -%}
-                {%- set details = 'Version outside vulnerable ranges' -%}
+                {%- set status = 'ИСПРАВЛЕН' -%}
+                {%- set details = 'Версия вне уязвимых диапазонов' -%}
               {%- endif -%}
-              {%- set _ = rows.append({
+              {%- set _ = ns.rows.append({
                 'host': inventory_hostname,
-                'os': os_val,
+                'os': ns.os_val,
                 'runtime': p[1] | default('-'),
                 'target': p[2] | default('-'),
                 'image': p[3] | default('-'),
                 'path': p[4] | default('-'),
                 'version': v,
-                'app_state': p[6] | default('unknown'),
+                'app_state': state_map.get(raw_st, raw_st),
                 'cve_status': status,
                 'details': details
               }) -%}
             {%- endfor -%}
           {%- endif -%}
-          {{ rows }}
+          {{ ns.rows }}
 
-- name: Формирование сводки на экран и сохранение CSV-отчёта на adm.lin
-  hosts: "{{ report_host | default('adm.lin') }}"
-  gather_facts: true
-  vars:
-    target_hosts: "all"
-    report_dir: "{{ ansible_env.HOME }}/cve-reports"
-    include_clean_hosts: true
-
-  tasks:
-    - name: Определение пути файла отчёта и объединение результатов
+    - name: Агрегация и сортировка результатов по критичности
       ansible.builtin.set_fact:
-        report_file: "{{ report_dir }}/cve-2026-45156_{{ ansible_date_time.iso8601_basic_short }}.csv"
+        report_file: "{{ report_dir }}/cve-2026-45156_{{ now(fmt='%Y%m%d_%H%M%S') }}.csv"
         all_findings: >-
           {%- set combined = [] -%}
-          {%- for h in query('inventory_hostnames', target_hosts) -%}
+          {%- for h in ansible_play_hosts_all -%}
             {%- if hostvars[h].cve_findings is defined -%}
               {%- for row in hostvars[h].cve_findings -%}
                 {%- set _ = combined.append(row) -%}
@@ -248,67 +296,99 @@
             {%- else -%}
               {%- set _ = combined.append({
                 'host': h,
-                'os': 'unknown',
+                'os': 'неизвестно',
                 'runtime': '-',
                 'target': '-',
                 'image': '-',
                 'path': '-',
                 'version': '-',
                 'app_state': '-',
-                'cve_status': 'UNREACHABLE',
-                'details': 'Host unreachable or skipped'
+                'cve_status': 'НЕДОСТУПЕН',
+                'details': 'Хост недоступен или пропущен'
               }) -%}
             {%- endif -%}
           {%- endfor -%}
-          {{ combined }}
+          {%- set ordered = [] -%}
+          {%- for st in ['УЯЗВИМ', 'ВЕРСИЯ НЕ ОПРЕДЕЛЕНА', 'ОШИБКА СКАНИРОВАНИЯ', 'НЕДОСТУПЕН', 'ИСПРАВЛЕН', 'НЕ НАЙДЕН'] -%}
+            {%- for row in (combined | selectattr('cve_status', 'equalto', st) | sort(attribute='host')) -%}
+              {%- set _ = ordered.append(row) -%}
+            {%- endfor -%}
+          {%- endfor -%}
+          {{ ordered }}
+      run_once: true
 
-    - name: Создание директории для отчётов на adm.lin
-      ansible.builtin.file:
-        path: "{{ report_dir }}"
-        state: directory
-        mode: "0750"
+    - name: Сохранение CSV-отчёта на adm.lin для русского Excel (UTF-8 BOM + CRLF + ';')
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - |
+            import csv, json, os, sys
+            report_file = os.path.abspath(os.path.expanduser(sys.argv[1]))
+            include_clean = sys.argv[2].lower() == 'true'
+            rows = json.load(sys.stdin)
+            report_dir = os.path.dirname(report_file)
+            if report_dir:
+                os.makedirs(report_dir, mode=0o750, exist_ok=True)
+            header = [
+                'Хост', 'ОС', 'Среда', 'Цель', 'Образ',
+                'Путь', 'Версия', 'Статус модуля', 'Статус CVE', 'Детали'
+            ]
+            keys = [
+                'host', 'os', 'runtime', 'target', 'image',
+                'path', 'version', 'app_state', 'cve_status', 'details'
+            ]
+            with open(report_file, 'w', encoding='utf-8-sig', newline='') as f:
+                writer = csv.writer(f, dialect='excel', delimiter=';', quoting=csv.QUOTE_MINIMAL)
+                writer.writerow(header)
+                for r in rows:
+                    if not include_clean and r.get('cve_status') == 'НЕ НАЙДЕН':
+                        continue
+                    writer.writerow([
+                        ' '.join(str(r.get(k, '-')).splitlines()).strip()
+                        for k in keys
+                    ])
+            os.chmod(report_file, 0o640)
+            print(report_file)
+          - "{{ report_file }}"
+          - "{{ include_clean_hosts | bool }}"
+        stdin: "{{ all_findings | to_json }}"
+      register: csv_save
+      delegate_to: "{{ report_host }}"
+      become: "{{ report_become }}"
+      run_once: true
+      check_mode: false
+      changed_when: false
 
-    - name: Сохранение CSV-отчёта на adm.lin
-      ansible.builtin.copy:
-        dest: "{{ report_file }}"
-        mode: "0640"
-        content: |
-          host,os,runtime,target,image,path,version,app_state,cve_status,details
-          {%- macro q(v) -%}"{{ (v | string) | replace('"', '""') }}"{%- endmacro -%}
-          {%- for r in all_findings -%}
-            {%- if include_clean_hosts | bool or r.cve_status != 'NOT_FOUND' %}
-          {{ q(r.host) }},{{ q(r.os) }},{{ q(r.runtime) }},{{ q(r.target) }},{{ q(r.image) }},{{ q(r.path) }},{{ q(r.version) }},{{ q(r.app_state) }},{{ q(r.cve_status) }},{{ q(r.details) }}
-            {%- endif -%}
-          {%- endfor %}
-
-    - name: Подготовка текстовой сводки для вывода в консоль
-      ansible.builtin.set_fact:
-        summary_lines: >-
-          {%- set vuln = all_findings | selectattr('cve_status', 'equalto', 'VULNERABLE') | list -%}
-          {%- set unk = all_findings | selectattr('cve_status', 'equalto', 'UNKNOWN_VERSION') | list -%}
-          {%- set patched = all_findings | selectattr('cve_status', 'equalto', 'PATCHED') | list -%}
-          {%- set err = all_findings | selectattr('cve_status', 'in', ['UNREACHABLE', 'SCAN_ERROR']) | list -%}
+    - name: Подготовка и вывод сводки на экран
+      ansible.builtin.debug:
+        msg: >-
+          {%- set vuln = all_findings | selectattr('cve_status', 'equalto', 'УЯЗВИМ') | list -%}
+          {%- set unk = all_findings | selectattr('cve_status', 'equalto', 'ВЕРСИЯ НЕ ОПРЕДЕЛЕНА') | list -%}
+          {%- set patched = all_findings | selectattr('cve_status', 'equalto', 'ИСПРАВЛЕН') | list -%}
+          {%- set err = all_findings | selectattr('cve_status', 'in', ['НЕДОСТУПЕН', 'ОШИБКА СКАНИРОВАНИЯ']) | list -%}
+          {%- set saved_path = (csv_save.stdout | default('') | trim) or report_file -%}
           {%- set lines = [
             '============================================================',
             'CVE-2026-45156 (Nextcloud user_oidc) — Итоги аудита',
-            'Хостов в выборке: ' ~ (query('inventory_hostnames', target_hosts) | length),
-            'VULNERABLE:       ' ~ (vuln | length),
-            'UNKNOWN_VERSION:  ' ~ (unk | length),
-            'PATCHED:          ' ~ (patched | length),
-            'UNREACHABLE/ERR:  ' ~ (err | length),
-            'CSV-отчёт:        ' ~ inventory_hostname ~ ':' ~ report_file,
+            'Хостов в выборке: ' ~ (ansible_play_hosts_all | length),
+            'УЯЗВИМ:           ' ~ (vuln | length),
+            'НЕ ОПРЕДЕЛЕНА:    ' ~ (unk | length),
+            'ИСПРАВЛЕН:        ' ~ (patched | length),
+            'НЕДОСТУПЕН/ОШИБ.: ' ~ (err | length),
+            'CSV-отчёт:        ' ~ report_host ~ ':' ~ saved_path,
             '============================================================'
           ] -%}
           {%- if vuln | length > 0 -%}
             {%- set _ = lines.append('--- УЯЗВИМЫЕ ИНСТАНСЫ ---') -%}
             {%- for r in vuln -%}
-              {%- set _ = lines.append('[VULNERABLE] ' ~ r.host ~ ' | ' ~ r.runtime ~ ':' ~ r.target ~ ' | ver=' ~ r.version ~ ' | state=' ~ r.app_state ~ ' | ' ~ r.path) -%}
+              {%- set _ = lines.append('[УЯЗВИМ] ' ~ r.host ~ ' (' ~ r.os ~ ') | ' ~ r.runtime ~ ':' ~ r.target ~ ' | вер=' ~ r.version ~ ' | статус=' ~ r.app_state ~ ' | ' ~ r.path) -%}
             {%- endfor -%}
           {%- endif -%}
           {%- if unk | length > 0 -%}
             {%- set _ = lines.append('--- ТРЕБУЕТСЯ РУЧНАЯ ПРОВЕРКА ---') -%}
             {%- for r in unk -%}
-              {%- set _ = lines.append('[UNKNOWN] ' ~ r.host ~ ' | ' ~ r.runtime ~ ':' ~ r.target ~ ' | ' ~ r.path) -%}
+              {%- set _ = lines.append('[НЕ ОПРЕДЕЛЕНА] ' ~ r.host ~ ' | ' ~ r.runtime ~ ':' ~ r.target ~ ' | ' ~ r.path) -%}
             {%- endfor -%}
           {%- endif -%}
           {%- if err | length > 0 -%}
@@ -318,7 +398,4 @@
             {%- endfor -%}
           {%- endif -%}
           {{ lines }}
-
-    - name: Вывод результатов аудита на экран
-      ansible.builtin.debug:
-        msg: "{{ summary_lines }}"
+      run_once: true
